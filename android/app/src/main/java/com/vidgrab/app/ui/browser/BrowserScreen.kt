@@ -55,6 +55,6 @@ fun BrowserScreen(
                 modifier = Modifier.align(Alignment.BottomEnd).navigationBarsPadding().padding(bottom = 68.dp)
             )
         }
-        if (sheet) VideoSheet(tab.videos.toList(), onDismiss = { sheet = false })
+        if (sheet) VideoSheet(tab, tab.videos.toList(), onDismiss = { sheet = false })
     }
 }
