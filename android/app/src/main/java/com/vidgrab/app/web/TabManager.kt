@@ -39,7 +39,7 @@ import java.lang.ref.WeakReference
 import java.net.URLEncoder
 
 /** État d'un onglet. Les champs @Volatile sont lus par le thread réseau du WebView (jamais les états Compose). */
-class TabState(val id: Int) {
+class TabState(val id: Int, val isBatchTab: Boolean = false) {
     @Volatile var currentUrl: String = ""
     @Volatile var currentTitle: String = ""
     @Volatile var lastTypedAt: Long = 0L
@@ -105,6 +105,8 @@ object TabManager {
     private const val BRIDGE = "VidGrab"
 
     private lateinit var appContext: Context
+    val context: Context get() = appContext
+
     private var activityRef: WeakReference<Activity>? = null
     private val wrappers = mutableListOf<MutableContextWrapper>()
     private var nextId = 1
@@ -141,6 +143,16 @@ object TabManager {
         val t = TabState(nextId++)
         tabs.add(t)
         currentIndex = tabs.lastIndex
+        return t
+    }
+
+    /** Ouvre un onglet dédié au robot sans interrompre l'onglet que regarde l'utilisateur. */
+    fun openBackgroundTab(from: TabState): TabState {
+        val t = TabState(nextId++, isBatchTab = true).apply {
+            desktop = from.desktop
+            lastClickedPlayer = from.lastClickedPlayer
+        }
+        tabs.add(t)
         return t
     }
 
@@ -186,6 +198,7 @@ object TabManager {
         tab.lastTypedAt = System.currentTimeMillis()
         tab.url = url
         tab.currentUrl = url
+        tab.loading = true
         tab.videos.clear()
         tab.sniffer.reset()
         webViewFor(tab).loadUrl(url)
@@ -255,7 +268,6 @@ object TabManager {
     @SuppressLint("SetJavaScriptEnabled")
     fun webViewFor(tab: TabState): WebView {
         tab.webView?.let { return it }
-        // JAMAIS applicationContext directement : les <select> HTML natifs exigent un contexte d'Activity.
         val wrapper = MutableContextWrapper(activityRef?.get() ?: appContext)
         wrappers.add(wrapper)
         tab.wrapper = wrapper
@@ -294,7 +306,6 @@ object TabManager {
         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
             val uri = request.url
             val host = uri.host
-            // Sous-requêtes publicitaires : réponse vide 200 OK
             if (!request.isForMainFrame && AdBlocker.isAdHost(host)) {
                 return WebResourceResponse("text/plain", "utf-8", 200, "OK", emptyMap(), ByteArrayInputStream(ByteArray(0)))
             }
@@ -302,17 +313,15 @@ object TabManager {
             val headers = HashMap<String, String>(request.requestHeaders)
             val cookie: String? = runCatching { CookieManager.getInstance().getCookie(url) }.getOrNull()
             if (!cookie.isNullOrBlank()) headers["Cookie"] = cookie
-            // Thread IO du WebView : champs @Volatile uniquement
             tab.sniffer.onRequest(url, headers, tab.currentUrl, tab.currentTitle)
             return null
         }
 
         override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-            // Ne jamais bloquer les sous-frames (lecteurs iframe externes)
             if (!request.isForMainFrame) return false
             val uri = request.url
             val scheme = uri.scheme?.lowercase()
-            if (scheme != "http" && scheme != "https") return true // intent://, market://, ...
+            if (scheme != "http" && scheme != "https") return true
             val host = uri.host
             if (AdBlocker.isAdHost(host)) return true
 
@@ -353,7 +362,7 @@ object TabManager {
             tab.currentTitle = t
             view.evaluateJavascript(AdBlocker.INJECTED_JS, null)
             view.evaluateJavascript(PageAutomator.PLAYER_TRACKER_JS, null)
-            AppPrefs.addHistory(t, url)
+            if (!tab.isBatchTab) AppPrefs.addHistory(t, url)
             BatchSeriesManager.onPageFinished(tab.id, url)
         }
 
@@ -379,7 +388,6 @@ object TabManager {
         return null
     }
 
-    /** Dialogue JS sécurisé : Activity valide obligatoire + garde `handled` contre le double confirm/cancel. */
     private fun showJsDialog(view: WebView, message: String, withCancel: Boolean, result: JsResult, fallbackConfirm: Boolean): Boolean {
         val act = findActivity(view.context)
         var handled = false
@@ -422,7 +430,6 @@ object TabManager {
             tab.currentTitle = title.orEmpty()
         }
 
-        // Neutralise 100 % des fenêtres publicitaires : on ne charge JAMAIS l'URL demandée.
         override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean = false
 
         override fun onJsAlert(view: WebView, url: String?, message: String?, result: JsResult): Boolean =
