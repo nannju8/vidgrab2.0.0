@@ -57,6 +57,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.vidgrab.app.data.BatchStatus
 import com.vidgrab.app.download.BatchSeriesManager
 import com.vidgrab.app.download.DownloadCenter
+import com.vidgrab.app.transfer.TransferManager
 import com.vidgrab.app.ui.browser.BrowserScreen
 import com.vidgrab.app.ui.browser.HelpGuide
 import com.vidgrab.app.ui.browser.TabSwitcher
@@ -68,17 +69,20 @@ import com.vidgrab.app.ui.downloads.ProgressScreen
 import com.vidgrab.app.ui.library.LibraryScreen
 import com.vidgrab.app.ui.settings.SettingsScreen
 import com.vidgrab.app.ui.theme.VG
+import com.vidgrab.app.ui.transfer.TransferScreen
 import com.vidgrab.app.web.TabManager
 
-/** Scaffold principal : 3 onglets + barre flottante en verre + hébergement du Robot en arrière-plan. */
+/** Scaffold principal : 3 onglets + barre flottante + Robot en arrière-plan + Transfert hors ligne. */
 @Composable
 fun MainScreen(vm: MainViewModel = viewModel()) {
     val ctx = LocalContext.current
     var page by rememberSaveable { mutableIntStateOf(0) }
     var showTabs by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
+    var showTransfer by remember { mutableStateOf(false) }
     var showHelp by remember { mutableStateOf(false) }
     val tasks by DownloadCenter.tasks.collectAsStateWithLifecycle()
+    val tx by TransferManager.state.collectAsStateWithLifecycle()
     val batch by BatchSeriesManager.state.collectAsStateWithLifecycle()
     val tab = TabManager.current
     val batchTab = batch.config?.tabId?.let { id -> TabManager.tabs.firstOrNull { it.id == id } }
@@ -88,10 +92,10 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
         DownloadCenter.events.collect { Toast.makeText(ctx, it, Toast.LENGTH_SHORT).show() }
     }
 
-    // Bascule automatiquement vers l'onglet du Robot uniquement si une action humaine (Cloudflare/Play) est requise
     LaunchedEffect(batch.status, batch.config?.tabId) {
         if (batch.status == BatchStatus.NEEDS_USER && batchTab != null) {
             TabManager.switchTo(batchTab)
+            showTransfer = false
             showTabs = false
             showSettings = false
             showHelp = false
@@ -99,8 +103,9 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
         }
     }
 
-    BackHandler(enabled = showTabs || showSettings || page != 0 || !tab.isHome || tab.customView != null) {
+    BackHandler(enabled = showTransfer || showTabs || showSettings || page != 0 || !tab.isHome || tab.customView != null) {
         when {
+            showTransfer -> showTransfer = false
             showTabs -> showTabs = false
             showSettings -> showSettings = false
             page == 0 && tab.customView != null -> {
@@ -120,7 +125,6 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
     }
 
     Box(Modifier.fillMaxSize()) {
-        // Maintient la WebView du Robot attachée à taille réelle même quand l'utilisateur navigue ailleurs dans l'app
         val keepRobotAlive = batchTab != null &&
             batch.status != BatchStatus.IDLE &&
             batch.status != BatchStatus.DONE &&
@@ -140,7 +144,6 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
             }
         }
 
-        // Consomme les clics résiduels pour qu'ils n'atteignent jamais la WebView cachée en dessous
         val guardModifier = if (keepRobotAlive) {
             Modifier.fillMaxSize().pointerInput(Unit) {
                 awaitPointerEventScope {
@@ -163,12 +166,11 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
             ) { p ->
                 when (p) {
                     0 -> BrowserScreen(vm, onOpenTabs = openTabs, onOpenSettings = { showSettings = true }, onOpenHelp = { showHelp = true })
-                    1 -> ProgressScreen()
-                    else -> LibraryScreen(vm)
+                    1 -> ProgressScreen(onOpenTransfer = { showTransfer = true })
+                    else -> LibraryScreen(vm, onOpenTransfer = { showTransfer = true })
                 }
             }
 
-            // Pastille flottante discrète quand le Robot tourne dans un autre onglet (ou vient de finir)
             AnimatedVisibility(
                 visible = batch.status != BatchStatus.IDLE && !robotVisibleInWebScreen && page != 1,
                 enter = fadeIn() + slideInVertically { it / 2 },
@@ -197,18 +199,11 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
                         Column(Modifier.weight(1f)) {
                             Text(
                                 if (done) "Détection terminée" else "Robot · Ép. ${batch.currentEp}/${batch.config?.endEp ?: batch.totalEps}",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = glow,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
+                                fontSize = 11.sp, fontWeight = FontWeight.Bold, color = glow, maxLines = 1, overflow = TextOverflow.Ellipsis
                             )
                             Text(
-                                batch.message,
-                                fontSize = 10.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
+                                batch.message, fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis
                             )
                         }
                         Spacer(Modifier.width(6.dp))
@@ -224,7 +219,9 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
             }
 
             FloatingNavBar(
-                selected = page, onSelect = { page = it }, downloadCount = tasks.size,
+                selected = page,
+                onSelect = { page = it },
+                downloadCount = tasks.size + if (tx.isActive) 1 else 0,
                 modifier = Modifier.align(Alignment.BottomCenter)
             )
         }
@@ -240,6 +237,12 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
             enter = slideInVertically { it / 3 } + fadeIn(),
             exit = slideOutVertically { it / 3 } + fadeOut()
         ) { SettingsScreen(onBack = { showSettings = false }) }
+
+        AnimatedVisibility(
+            visible = showTransfer,
+            enter = slideInVertically { it / 3 } + fadeIn(),
+            exit = slideOutVertically { it / 3 } + fadeOut()
+        ) { TransferScreen(vm, onBack = { showTransfer = false }) }
 
         if (showHelp) HelpGuide(onDismiss = { showHelp = false })
     }
