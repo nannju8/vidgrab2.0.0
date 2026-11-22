@@ -17,6 +17,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Movie
+import androidx.compose.material.icons.rounded.PlaylistAdd
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -24,7 +25,11 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -35,18 +40,23 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.vidgrab.app.data.DetectedVideo
 import com.vidgrab.app.data.Format
+import com.vidgrab.app.download.BatchSeriesManager
 import com.vidgrab.app.download.DownloadCenter
 import com.vidgrab.app.ui.components.GlassCard
+import com.vidgrab.app.ui.components.GlassSquareButton
 import com.vidgrab.app.ui.components.GradientButton
 import com.vidgrab.app.ui.components.staggerIn
 import com.vidgrab.app.ui.theme.VG
+import com.vidgrab.app.web.TabState
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun VideoSheet(videos: List<DetectedVideo>, onDismiss: () -> Unit) {
+fun VideoSheet(tab: TabState, videos: List<DetectedVideo>, onDismiss: () -> Unit) {
     val state = rememberModalBottomSheetState(skipPartiallyExpanded = false)
     val scope = rememberCoroutineScope()
+    var batchQuality by remember { mutableStateOf<String?>(null) }
+
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = state,
@@ -87,20 +97,46 @@ fun VideoSheet(videos: List<DetectedVideo>, onDismiss: () -> Unit) {
                                     }
                                 }
                                 Spacer(Modifier.size(12.dp))
-                                GradientButton(
-                                    "Télécharger", Modifier.fillMaxWidth(), Icons.Rounded.Download,
-                                    brush = VG.alert, glow = VG.Coral,
-                                    onClick = {
-                                        DownloadCenter.enqueue(v)
-                                        scope.launch { state.hide() }.invokeOnCompletion { onDismiss() }
+                                Row(
+                                    Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    GradientButton(
+                                        "Télécharger", Modifier.weight(1f), Icons.Rounded.Download,
+                                        brush = VG.alert, glow = VG.Coral,
+                                        onClick = {
+                                            DownloadCenter.enqueue(v)
+                                            scope.launch { state.hide() }.invokeOnCompletion { onDismiss() }
+                                        }
+                                    )
+                                    GlassSquareButton(
+                                        size = 48.dp,
+                                        glow = VG.Indigo,
+                                        onClick = { batchQuality = v.resolution }
+                                    ) {
+                                        Icon(Icons.Rounded.PlaylistAdd, "Mode Série", tint = VG.Cyan)
                                     }
-                                )
+                                }
                             }
                         }
                     }
                 }
             }
         }
+    }
+
+    batchQuality?.let { q ->
+        BatchSetupDialog(
+            tab = tab,
+            initialQuality = if (q == "Auto") "Meilleure" else q,
+            onStart = { cfg ->
+                batchQuality = null
+                BatchSeriesManager.start(cfg)
+                scope.launch { state.hide() }.invokeOnCompletion { onDismiss() }
+            },
+            onDismiss = { batchQuality = null }
+        )
     }
 }
 
