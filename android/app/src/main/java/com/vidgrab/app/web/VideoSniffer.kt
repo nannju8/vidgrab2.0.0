@@ -230,21 +230,4 @@ class VideoSniffer(private val onFound: (DetectedVideo) -> Unit) {
             return m.groupValues[1] + "p"
         }
     }
-}* Extension extraite uniquement du dernier segment du chemin (ex: /v1.2/stream/master → ""). */
-        fun extensionOf(uri: Uri): String {
-            val last = (uri.path ?: "").substringAfterLast('/', "")
-            return if (last.contains('.')) last.substringAfterLast('.').lowercase() else ""
-        }
-
-        fun looksLikeSegment(url: String): Boolean {
-            val l = url.lowercase()
-            return l.contains("/seg") || l.contains("seg-") || l.contains("segment") ||
-                l.contains("chunk-") || l.contains(".m4s") || l.contains("init.")
-        }
-
-        fun guessResolution(url: String): String {
-            val m = resRegex.find(url) ?: return "Auto"
-            return m.groupValues[1] + "p"
-        }
-    }
 }
