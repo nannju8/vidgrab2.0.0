@@ -48,3 +48,42 @@ data class LibraryItem(
     val isPrivate: Boolean,
     val file: File?
 )
+// Dans DetectedVideo, ajouter le dernier paramètre avec valeur par défaut :
+data class DetectedVideo(
+    val id: String,
+    val url: String,
+    val title: String,
+    /** "MP4", "HLS", "WEBM", "MKV" */
+    val format: String,
+    val sizeBytes: Long,
+    /** "480p", "720p", "1080p" ou "Auto" */
+    val resolution: String,
+    val pageUrl: String,
+    /** En-têtes exacts de la requête d'origine (Referer, Origin, User-Agent, Cookie). */
+    val headers: Map<String, String>,
+    val durationSec: Double = 0.0
+)
+
+// À ajouter à la fin de Models.kt :
+enum class BatchStatus { IDLE, WAITING_SLOT, LOADING_PAGE, AUTOMATING, NEEDS_USER, PAUSED, DONE }
+
+data class BatchConfig(
+    val tabId: Int,
+    val urlTemplate: String,
+    val seriesTitle: String,
+    val startEp: Int,
+    val endEp: Int,
+    val padWidth: Int,
+    val targetQuality: String,
+    val preferredPlayers: List<String>
+)
+
+data class BatchState(
+    val status: BatchStatus = BatchStatus.IDLE,
+    val config: BatchConfig? = null,
+    val currentEp: Int = 0,
+    val totalEps: Int = 0,
+    val message: String = "",
+    val completedCount: Int = 0,
+    val failedEps: List<Int> = emptyList()
+)
