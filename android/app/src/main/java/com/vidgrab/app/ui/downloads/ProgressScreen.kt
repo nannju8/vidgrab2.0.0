@@ -26,6 +26,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Cancel
 import androidx.compose.material.icons.rounded.CloudDownload
 import androidx.compose.material.icons.rounded.Downloading
@@ -53,9 +54,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.vidgrab.app.data.BatchStatus
 import com.vidgrab.app.data.DlStatus
 import com.vidgrab.app.data.DownloadTask
 import com.vidgrab.app.data.Format
+import com.vidgrab.app.download.BatchSeriesManager
 import com.vidgrab.app.download.DownloadCenter
 import com.vidgrab.app.ui.components.GlassCard
 import com.vidgrab.app.ui.components.ScreenTitle
@@ -70,6 +73,7 @@ import kotlin.math.sin
 fun ProgressScreen() {
     val tasks by DownloadCenter.tasks.collectAsStateWithLifecycle()
     val blocked by DownloadCenter.wifiBlocked.collectAsStateWithLifecycle()
+    val batch by BatchSeriesManager.state.collectAsStateWithLifecycle()
     val speed: Long = tasks.filter { it.status == DlStatus.RUNNING }.sumOf { it.speedBps }
 
     Column(Modifier.fillMaxSize().statusBarsPadding()) {
@@ -94,6 +98,30 @@ fun ProgressScreen() {
                     Text(
                         "Mode « Wi-Fi uniquement » actif : les téléchargements sont en attente. Ils reprendront automatiquement dès la connexion à un réseau Wi-Fi.",
                         fontSize = 13.sp
+                    )
+                }
+            }
+        }
+
+        if (batch.status != BatchStatus.IDLE) {
+            GlassCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp), glow = VG.Cyan) {
+                Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Rounded.AutoAwesome, null, tint = VG.Cyan)
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            "Mode Série · Ép. ${batch.currentEp}/${batch.config?.endEp ?: "?"}",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp
+                        )
+                        Text(batch.message, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Text(
+                        "Arrêter",
+                        color = VG.Coral,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 12.sp,
+                        modifier = Modifier.bounceClick { BatchSeriesManager.stop() }.padding(6.dp)
                     )
                 }
             }
@@ -193,6 +221,36 @@ private fun TaskCard(t: DownloadTask, modifier: Modifier) {
                         DlStatus.PAUSED, DlStatus.WAITING_WIFI -> RoundAction(Icons.Rounded.PlayArrow, VG.Cyan) { DownloadCenter.resume(t.id) }
                         DlStatus.FAILED -> RoundAction(Icons.Rounded.Refresh, VG.Cyan) { DownloadCenter.resume(t.id) }
                         else -> RoundAction(Icons.Rounded.Pause, VG.Indigo) { DownloadCenter.pause(t.id) }
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    RoundAction(Icons.Rounded.Cancel, VG.Coral) { DownloadCenter.cancel(t.id) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RoundAction(icon: ImageVector, tint: Color, onClick: () -> Unit) {
+    Box(
+        Modifier.size(38.dp).shadow(6.dp, CircleShape, ambientColor = tint, spotColor = tint)
+            .clip(CircleShape).background(tint.copy(alpha = 0.18f)).bounceClick(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) { Icon(icon, null, tint = tint, modifier = Modifier.size(20.dp)) }
+}
+
+/** Icône de flux animée : la flèche « coule » en boucle pendant le téléchargement. */
+@Composable
+private fun FlowIcon(active: Boolean) {
+    val t = rememberInfiniteTransition(label = "flow")
+    val y by t.animateFloat(-5f, 5f, infiniteRepeatable(tween(700), RepeatMode.Reverse), label = "y")
+    Box(
+        Modifier.size(46.dp).clip(RoundedCornerShape(14.dp)).background(VG.brand),
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(Icons.Rounded.Downloading, null, tint = Color.White, modifier = Modifier.size(26.dp).graphicsLayer { translationY = if (active) y else 0f })
+    }
+}                      else -> RoundAction(Icons.Rounded.Pause, VG.Indigo) { DownloadCenter.pause(t.id) }
                     }
                     Spacer(Modifier.width(8.dp))
                     RoundAction(Icons.Rounded.Cancel, VG.Coral) { DownloadCenter.cancel(t.id) }
