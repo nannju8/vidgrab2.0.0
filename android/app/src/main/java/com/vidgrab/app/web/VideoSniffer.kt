@@ -10,19 +10,26 @@ import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Détecteur de flux vidéo : analyse du Content-Type + signature binaire (#EXTM3U, ftyp, EBML)
- * pour démasquer les vidéos camouflées en .txt / .png / .js / sans extension.
+ * avec jeton de génération pour ne jamais mélanger les flux entre deux épisodes.
  */
-class VideoSniffer(private val onFound: (DetectedVideo) -> Unit) {
+class VideoSniffer(private val onFound: (DetectedVideo, Long) -> Unit) {
 
     @Volatile
     var userAgent: String = ""
 
     private val seen: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    private val generation = AtomicLong(0L)
 
-    fun reset() = seen.clear()
+    fun isCurrent(gen: Long): Boolean = gen == generation.get()
+
+    fun reset() {
+        seen.clear()
+        generation.incrementAndGet()
+    }
 
     /** Appelé depuis shouldInterceptRequest (thread IO du WebView). */
     fun onRequest(url: String, reqHeaders: Map<String, String>, pageUrl: String, pageTitle: String) {
@@ -35,8 +42,11 @@ class VideoSniffer(private val onFound: (DetectedVideo) -> Unit) {
         if (ext != "m3u8" && looksLikeSegment(url)) return
         if (ext !in CANDIDATE_EXT) return
         if (!seen.add(url)) return
+        val gen = generation.get()
         val headers = buildHeaders(reqHeaders, pageUrl, url)
-        pool.execute { runCatching { analyze(url, headers, ext, pageUrl, pageTitle) } }
+        pool.execute {
+            if (gen == generation.get()) runCatching { analyze(url, headers, ext, pageUrl, pageTitle, gen) }
+        }
     }
 
     /** Filet de sécurité : URL remontée par l'écouteur JS sur <video>. */
@@ -46,15 +56,19 @@ class VideoSniffer(private val onFound: (DetectedVideo) -> Unit) {
         val host = uri.host?.lowercase() ?: return
         if (isExcluded(host) || isExcluded(Uri.parse(pageUrl).host)) return
         if (!seen.add(src)) return
-        val ext = extensionOf(uri)
+        val gen = generation.get()
         val headers = buildHeaders(emptyMap(), pageUrl, src)
         pool.execute {
-            val found = runCatching { analyze(src, headers, ext, pageUrl, pageTitle) }.getOrDefault(false)
-            if (!found && ext != "ts" && ext != "m4s") {
-                val fmt = when (ext) {
-                    "m3u8" -> "HLS"; "webm" -> "WEBM"; "mkv" -> "MKV"; else -> "MP4"
+            if (gen != generation.get()) return@execute
+            val found = runCatching { analyze(src, headers, ext = extensionOf(uri), pageUrl, pageTitle, gen) }.getOrDefault(false)
+            if (!found && gen == generation.get()) {
+                val ext = extensionOf(uri)
+                if (ext != "ts" && ext != "m4s") {
+                    val fmt = when (ext) {
+                        "m3u8" -> "HLS"; "webm" -> "WEBM"; "mkv" -> "MKV"; else -> "MP4"
+                    }
+                    emit(src, fmt, -1L, guessResolution(src), headers, pageUrl, pageTitle, gen = gen)
                 }
-                emit(src, fmt, -1L, guessResolution(src), headers, pageUrl, pageTitle)
             }
         }
     }
@@ -89,7 +103,6 @@ class VideoSniffer(private val onFound: (DetectedVideo) -> Unit) {
             val buf = ByteArray(512)
             var n = 0
             if (r.isSuccessful) {
-                // Jamais body.string() : 512 octets max puis fermeture immédiate (anti-OOM)
                 val ins = r.body?.byteStream()
                 if (ins != null) {
                     while (n < 512) {
@@ -112,12 +125,13 @@ class VideoSniffer(private val onFound: (DetectedVideo) -> Unit) {
     }
 
     /** @return true si un flux a été détecté et émis. */
-    private fun analyze(url: String, headers: Map<String, String>, ext: String, pageUrl: String, pageTitle: String): Boolean {
+    private fun analyze(url: String, headers: Map<String, String>, ext: String, pageUrl: String, pageTitle: String, gen: Long): Boolean {
+        if (gen != generation.get()) return false
         val p = probe(url, headers) ?: return false
+        if (gen != generation.get()) return false
         val head = p.head
         val ct = p.contentType.lowercase()
 
-        // Segment MPEG-TS déguisé (0x47 aux octets 0 et 188) → rejeté
         if (head.size > 188 && head[0] == 0x47.toByte() && head[188] == 0x47.toByte()) return false
         if (ct.contains("mp2t")) return false
 
@@ -127,39 +141,42 @@ class VideoSniffer(private val onFound: (DetectedVideo) -> Unit) {
             head[2] == 0xDF.toByte() && head[3] == 0xA3.toByte()
 
         return when {
-            isM3u8 -> { emitHls(url, headers, pageUrl, pageTitle); true }
-            isFtyp -> directIfBigEnough(url, "MP4", p.size, headers, pageUrl, pageTitle)
+            isM3u8 -> { emitHls(url, headers, pageUrl, pageTitle, gen); true }
+            isFtyp -> directIfBigEnough(url, "MP4", p.size, headers, pageUrl, pageTitle, gen)
             isEbml -> {
                 val fmt = if (ct.contains("webm") || ext == "webm") "WEBM" else "MKV"
-                directIfBigEnough(url, fmt, p.size, headers, pageUrl, pageTitle)
+                directIfBigEnough(url, fmt, p.size, headers, pageUrl, pageTitle, gen)
             }
             ct.startsWith("video/") -> {
                 val fmt = when {
                     ct.contains("webm") -> "WEBM"; ct.contains("matroska") -> "MKV"; else -> "MP4"
                 }
-                directIfBigEnough(url, fmt, p.size, headers, pageUrl, pageTitle)
+                directIfBigEnough(url, fmt, p.size, headers, pageUrl, pageTitle, gen)
             }
-            ct.contains("mpegurl") -> { emitHls(url, headers, pageUrl, pageTitle); true }
+            ct.contains("mpegurl") -> { emitHls(url, headers, pageUrl, pageTitle, gen); true }
             else -> false
         }
     }
 
     private fun directIfBigEnough(
-        url: String, fmt: String, size: Long, headers: Map<String, String>, pageUrl: String, title: String
+        url: String, fmt: String, size: Long, headers: Map<String, String>, pageUrl: String, title: String, gen: Long
     ): Boolean {
         if (size in 0L..200_000L) return false
-        emit(url, fmt, size, guessResolution(url), headers, pageUrl, title)
+        emit(url, fmt, size, guessResolution(url), headers, pageUrl, title, gen = gen)
         return true
     }
 
-    private fun emitHls(url: String, headers: Map<String, String>, pageUrl: String, title: String) {
+    private fun emitHls(url: String, headers: Map<String, String>, pageUrl: String, title: String, gen: Long) {
+        if (gen != generation.get()) return
         val text: String? = HlsParser.fetchText(url, headers)
+        if (gen != generation.get()) return
         if (text == null) {
-            emit(url, "HLS", -1L, "Auto", headers, pageUrl, title)
+            emit(url, "HLS", -1L, "Auto", headers, pageUrl, title, gen = gen)
             return
         }
         if (HlsParser.isMaster(text)) {
             HlsParser.parseMaster(text, url).take(6).forEach { v ->
+                if (gen != generation.get()) return
                 val media: String? = runCatching { HlsParser.fetchText(v.url, headers) }.getOrNull()
                 var size: Long = -1L
                 var dur = 0.0
@@ -167,23 +184,24 @@ class VideoSniffer(private val onFound: (DetectedVideo) -> Unit) {
                     dur = HlsParser.parseMedia(media, v.url).totalDuration
                     if (dur > 0.0 && v.bandwidth > 0L) size = ((v.bandwidth.toDouble() / 8.0) * dur).toLong()
                 }
-                emit(v.url, "HLS", size, v.label, headers, pageUrl, title, dur)
+                emit(v.url, "HLS", size, v.label, headers, pageUrl, title, dur, gen)
             }
         } else {
             val pl = runCatching { HlsParser.parseMedia(text, url) }.getOrNull() ?: return
             if (pl.segments.isEmpty()) return
-            emit(url, "HLS", -1L, guessResolution(url), headers, pageUrl, title, pl.totalDuration)
+            emit(url, "HLS", -1L, guessResolution(url), headers, pageUrl, title, pl.totalDuration, gen)
         }
     }
 
     private fun emit(
         url: String, fmt: String, size: Long, res: String, headers: Map<String, String>,
-        pageUrl: String, pageTitle: String, durationSec: Double = 0.0
+        pageUrl: String, pageTitle: String, durationSec: Double = 0.0, gen: Long
     ) {
+        if (gen != generation.get()) return
         val fileName = Uri.parse(url).path.orEmpty().substringAfterLast('/', "").substringBeforeLast('.')
         val title = pageTitle.trim().ifBlank { fileName.ifBlank { Uri.parse(url).host.orEmpty() } }.take(90)
         val id = (url.hashCode().toLong() and 0xFFFFFFFFL).toString(16) + "_" + System.nanoTime().toString(16)
-        onFound(DetectedVideo(id, url, title, fmt, size, res, pageUrl, headers, durationSec))
+        onFound(DetectedVideo(id, url, title, fmt, size, res, pageUrl, headers, durationSec), gen)
     }
 
     companion object {
@@ -193,7 +211,6 @@ class VideoSniffer(private val onFound: (DetectedVideo) -> Unit) {
             "ts", "m4s", "css", "woff", "woff2", "ttf", "otf", "ico", "svg", "gif", "webp", "avif",
             "html", "htm", "map", "wasm", "vtt", "srt", "aac", "mp3", "json", "xml"
         )
-        // Extensions directes + extensions de camouflage fréquentes
         private val CANDIDATE_EXT = setOf(
             "mp4", "m4v", "webm", "mkv", "mov", "m3u8", "txt", "png", "jpg", "jpeg", "js", "php", "bin", "dat", ""
         )
@@ -213,7 +230,6 @@ class VideoSniffer(private val onFound: (DetectedVideo) -> Unit) {
             return EXCLUDED.any { h == it || h.endsWith(".$it") }
         }
 
-        /** Extension extraite uniquement du dernier segment du chemin (ex: /v1.2/stream/master → ""). */
         fun extensionOf(uri: Uri): String {
             val last = (uri.path ?: "").substringAfterLast('/', "")
             return if (last.contains('.')) last.substringAfterLast('.').lowercase() else ""
