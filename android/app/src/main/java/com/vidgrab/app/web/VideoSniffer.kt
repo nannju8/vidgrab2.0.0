@@ -162,26 +162,28 @@ class VideoSniffer(private val onFound: (DetectedVideo) -> Unit) {
             HlsParser.parseMaster(text, url).take(6).forEach { v ->
                 val media: String? = runCatching { HlsParser.fetchText(v.url, headers) }.getOrNull()
                 var size: Long = -1L
+                var dur = 0.0
                 if (media != null) {
-                    val dur: Double = HlsParser.parseMedia(media, v.url).totalDuration
+                    dur = HlsParser.parseMedia(media, v.url).totalDuration
                     if (dur > 0.0 && v.bandwidth > 0L) size = ((v.bandwidth.toDouble() / 8.0) * dur).toLong()
                 }
-                emit(v.url, "HLS", size, v.label, headers, pageUrl, title)
+                emit(v.url, "HLS", size, v.label, headers, pageUrl, title, dur)
             }
         } else {
             val pl = runCatching { HlsParser.parseMedia(text, url) }.getOrNull() ?: return
             if (pl.segments.isEmpty()) return
-            emit(url, "HLS", -1L, guessResolution(url), headers, pageUrl, title)
+            emit(url, "HLS", -1L, guessResolution(url), headers, pageUrl, title, pl.totalDuration)
         }
     }
 
     private fun emit(
-        url: String, fmt: String, size: Long, res: String, headers: Map<String, String>, pageUrl: String, pageTitle: String
+        url: String, fmt: String, size: Long, res: String, headers: Map<String, String>,
+        pageUrl: String, pageTitle: String, durationSec: Double = 0.0
     ) {
         val fileName = Uri.parse(url).path.orEmpty().substringAfterLast('/', "").substringBeforeLast('.')
         val title = pageTitle.trim().ifBlank { fileName.ifBlank { Uri.parse(url).host.orEmpty() } }.take(90)
         val id = (url.hashCode().toLong() and 0xFFFFFFFFL).toString(16) + "_" + System.nanoTime().toString(16)
-        onFound(DetectedVideo(id, url, title, fmt, size, res, pageUrl, headers))
+        onFound(DetectedVideo(id, url, title, fmt, size, res, pageUrl, headers, durationSec))
     }
 
     companion object {
@@ -212,6 +214,23 @@ class VideoSniffer(private val onFound: (DetectedVideo) -> Unit) {
         }
 
         /** Extension extraite uniquement du dernier segment du chemin (ex: /v1.2/stream/master → ""). */
+        fun extensionOf(uri: Uri): String {
+            val last = (uri.path ?: "").substringAfterLast('/', "")
+            return if (last.contains('.')) last.substringAfterLast('.').lowercase() else ""
+        }
+
+        fun looksLikeSegment(url: String): Boolean {
+            val l = url.lowercase()
+            return l.contains("/seg") || l.contains("seg-") || l.contains("segment") ||
+                l.contains("chunk-") || l.contains(".m4s") || l.contains("init.")
+        }
+
+        fun guessResolution(url: String): String {
+            val m = resRegex.find(url) ?: return "Auto"
+            return m.groupValues[1] + "p"
+        }
+    }
+}* Extension extraite uniquement du dernier segment du chemin (ex: /v1.2/stream/master → ""). */
         fun extensionOf(uri: Uri): String {
             val last = (uri.path ?: "").substringAfterLast('/', "")
             return if (last.contains('.')) last.substringAfterLast('.').lowercase() else ""
