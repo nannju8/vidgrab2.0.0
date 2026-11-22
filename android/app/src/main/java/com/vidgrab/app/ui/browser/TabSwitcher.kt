@@ -8,7 +8,6 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -156,7 +155,7 @@ private fun TabCard(tab: TabState, index: Int, selected: Boolean, onOpen: () -> 
             val c = colorFor(tab.url.ifBlank { "home${tab.id}" })
             GlassCard(
                 Modifier.fillMaxSize().then(if (selected) Modifier.border(2.dp, VG.brand, shape) else Modifier),
-                shape = shape, glow = c, onClick = onOpen
+                shape = shape, glow = if (tab.isBatchTab) VG.Cyan else c, onClick = onOpen
             ) {
                 val preview = tab.preview
                 if (preview != null && !tab.isHome) {
@@ -176,9 +175,9 @@ private fun TabCard(tab: TabState, index: Int, selected: Boolean, onOpen: () -> 
                     Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface.copy(alpha = 0.88f)).padding(start = 14.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Box(Modifier.size(28.dp).clip(CircleShape).background(c), contentAlignment = Alignment.Center) {
+                    Box(Modifier.size(28.dp).clip(CircleShape).background(if (tab.isBatchTab) VG.Cyan else c), contentAlignment = Alignment.Center) {
                         Text(
-                            if (tab.isHome) "V" else AppPrefs.hostOf(tab.url).take(1).uppercase(),
+                            if (tab.isBatchTab) "R" else if (tab.isHome) "V" else AppPrefs.hostOf(tab.url).take(1).uppercase(),
                             color = Color.White, fontWeight = FontWeight.Black, fontSize = 13.sp
                         )
                     }
@@ -187,6 +186,19 @@ private fun TabCard(tab: TabState, index: Int, selected: Boolean, onOpen: () -> 
                         if (tab.isHome) "Accueil" else tab.title.ifBlank { AppPrefs.hostOf(tab.url) },
                         Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold, fontSize = 14.sp
                     )
+                    if (tab.isBatchTab) {
+                        Text(
+                            "ROBOT",
+                            color = VG.Cyan,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Black,
+                            modifier = Modifier
+                                .padding(horizontal = 6.dp)
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(VG.Cyan.copy(alpha = 0.16f))
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
                     Box(Modifier.size(36.dp).bounceClick { flyOut(1f) }, contentAlignment = Alignment.Center) {
                         Icon(Icons.Rounded.Close, "Fermer l'onglet", Modifier.size(20.dp))
                     }
