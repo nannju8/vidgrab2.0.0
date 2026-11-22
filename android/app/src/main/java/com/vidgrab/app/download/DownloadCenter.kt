@@ -11,6 +11,7 @@ import com.vidgrab.app.data.AppPrefs
 import com.vidgrab.app.data.DetectedVideo
 import com.vidgrab.app.data.DlStatus
 import com.vidgrab.app.data.DownloadTask
+import com.vidgrab.app.data.Http
 import com.vidgrab.app.data.Storage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -21,7 +22,6 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import com.vidgrab.app.data.Http
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import org.json.JSONArray
@@ -63,18 +63,20 @@ object DownloadCenter {
     }
 
     // ---- API publique ---------------------------------------------------------------------
-    fun isActive(): Boolean = _tasks.value.any {
+    fun activeCount(): Int = _tasks.value.count {
         it.status == DlStatus.RUNNING || it.status == DlStatus.QUEUED || it.status == DlStatus.MERGING
     }
 
-    fun enqueue(video: DetectedVideo): Boolean {
+    fun isActive(): Boolean = activeCount() > 0
+
+    fun enqueue(video: DetectedVideo, silent: Boolean = false): Boolean {
         if (_tasks.value.any { it.video.url == video.url }) {
-            events.tryEmit("Déjà dans la file de téléchargement")
+            if (!silent) events.tryEmit("Déjà dans la file de téléchargement")
             return false
         }
         _tasks.update { it + DownloadTask(id = video.id, video = video) }
         persist()
-        events.tryEmit("Téléchargement ajouté à la file")
+        if (!silent) events.tryEmit("Téléchargement ajouté à la file")
         ensureService()
         pump()
         return true
@@ -255,6 +257,92 @@ object DownloadCenter {
         if (block) {
             var parked = false
             _tasks.value.filter { it.status == DlStatus.RUNNING || it.status == DlStatus.QUEUED }.forEach {
+                setStatus(it.id, DlStatus.WAITING_WIFI, interrupted = false)
+                Http.cancelAll(it.id)
+                jobs[it.id]?.cancel()
+                parked = true
+            }
+            wifiBlocked.value = parked || _tasks.value.any { it.status == DlStatus.WAITING_WIFI }
+            persist()
+        } else {
+            wifiBlocked.value = false
+            val waiting = _tasks.value.filter { it.status == DlStatus.WAITING_WIFI }
+            if (waiting.isNotEmpty()) {
+                _tasks.update { list -> list.map { if (it.status == DlStatus.WAITING_WIFI) it.copy(status = DlStatus.QUEUED) else it } }
+                ensureService()
+                pump()
+            }
+        }
+    }
+
+    // ---- Helpers ---------------------------------------------------------------------------
+    private fun find(id: String): DownloadTask? = _tasks.value.firstOrNull { it.id == id }
+
+    private fun setStatus(id: String, status: DlStatus, interrupted: Boolean? = null) {
+        _tasks.update { list ->
+            list.map {
+                if (it.id == id) it.copy(
+                    status = status,
+                    speedBps = if (status == DlStatus.RUNNING) it.speedBps else 0L,
+                    etaSec = if (status == DlStatus.RUNNING) it.etaSec else -1L,
+                    interrupted = interrupted ?: it.interrupted
+                ) else it
+            }
+        }
+        persist()
+    }
+
+    private fun ensureService() {
+        runCatching {
+            ContextCompat.startForegroundService(app, Intent(app, DownloadService::class.java))
+        }
+    }
+
+    // ---- Persistance ------------------------------------------------------------------------
+    private fun persist() {
+        runCatching {
+            val arr = JSONArray()
+            _tasks.value.forEach { t ->
+                val v = t.video
+                val headers = JSONObject()
+                v.headers.forEach { (k, value) -> headers.put(k, value) }
+                arr.put(
+                    JSONObject()
+                        .put("status", t.status.name)
+                        .put("downloaded", t.downloaded)
+                        .put("total", t.total)
+                        .put("id", v.id).put("url", v.url).put("title", v.title).put("format", v.format)
+                        .put("size", v.sizeBytes).put("res", v.resolution).put("page", v.pageUrl)
+                        .put("headers", headers)
+                )
+            }
+            AppPrefs.saveTasks(arr.toString())
+        }
+    }
+
+    private fun restore() {
+        runCatching {
+            val arr = JSONArray(AppPrefs.loadTasks())
+            val list = (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                val h = o.getJSONObject("headers")
+                val headers = HashMap<String, String>()
+                h.keys().forEach { k -> headers[k] = h.getString(k) }
+                val video = DetectedVideo(
+                    o.getString("id"), o.getString("url"), o.getString("title"), o.getString("format"),
+                    o.getLong("size"), o.getString("res"), o.getString("page"), headers
+                )
+                val wasPaused = o.getString("status") == DlStatus.PAUSED.name
+                DownloadTask(
+                    id = video.id, video = video, status = DlStatus.PAUSED,
+                    downloaded = o.getLong("downloaded"), total = o.getLong("total"),
+                    interrupted = !wasPaused
+                )
+            }
+            _tasks.value = list
+        }
+    }
+}      _tasks.value.filter { it.status == DlStatus.RUNNING || it.status == DlStatus.QUEUED }.forEach {
                 setStatus(it.id, DlStatus.WAITING_WIFI, interrupted = false)
                 Http.cancelAll(it.id)
                 jobs[it.id]?.cancel()
