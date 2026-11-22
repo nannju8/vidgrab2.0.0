@@ -31,7 +31,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import com.vidgrab.app.data.AppPrefs
+import com.vidgrab.app.data.BatchStatus
 import com.vidgrab.app.data.DetectedVideo
+import com.vidgrab.app.download.BatchSeriesManager
 import java.io.ByteArrayInputStream
 import java.lang.ref.WeakReference
 import java.net.URLEncoder
@@ -42,6 +44,7 @@ class TabState(val id: Int) {
     @Volatile var currentTitle: String = ""
     @Volatile var lastTypedAt: Long = 0L
     @Volatile var lastLinkClickAt: Long = 0L
+    @Volatile var lastClickedPlayer: String = ""
 
     var url by mutableStateOf("")
     var title by mutableStateOf("")
@@ -62,7 +65,12 @@ class TabState(val id: Int) {
     private val main = Handler(Looper.getMainLooper())
 
     val sniffer = VideoSniffer { v ->
-        main.post { if (videos.none { it.url == v.url }) videos.add(v) }
+        main.post {
+            if (videos.none { it.url == v.url }) {
+                videos.add(v)
+                BatchSeriesManager.onVideoDetected(id, v)
+            }
+        }
     }
 
     val isHome: Boolean get() = url.isBlank()
@@ -81,6 +89,13 @@ class JsBridge(private val tab: TabState) {
     @JavascriptInterface
     fun linkClicked(href: String) {
         tab.lastLinkClickAt = System.currentTimeMillis()
+    }
+
+    @Keep
+    @JavascriptInterface
+    fun onPlayerClicked(label: String) {
+        val clean = label.trim()
+        if (clean.isNotBlank()) tab.lastClickedPlayer = clean
     }
 }
 
@@ -135,6 +150,7 @@ object TabManager {
     }
 
     fun closeTab(tab: TabState) {
+        BatchSeriesManager.stopIfTab(tab.id)
         tab.webView?.let { wv ->
             runCatching {
                 wv.removeJavascriptInterface(BRIDGE)
@@ -176,7 +192,9 @@ object TabManager {
     }
 
     fun goHome(tab: TabState) {
+        BatchSeriesManager.stopIfTab(tab.id)
         tab.webView?.stopLoading()
+        tab.webView?.onPause()
         tab.url = ""
         tab.currentUrl = ""
         tab.title = ""
@@ -263,7 +281,7 @@ object TabManager {
         wv.addJavascriptInterface(JsBridge(tab), BRIDGE)
         wv.webViewClient = buildClient(tab)
         wv.webChromeClient = buildChrome(tab)
-        wv.setDownloadListener { url, ua, _, mime, _ ->
+        wv.setDownloadListener { url, _, _, mime, _ ->
             if (mime.startsWith("video") || url.contains(".mp4") || url.contains(".m3u8")) {
                 tab.sniffer.onJsVideo(url, tab.currentUrl, tab.currentTitle)
             }
@@ -281,6 +299,153 @@ object TabManager {
                 return WebResourceResponse("text/plain", "utf-8", 200, "OK", emptyMap(), ByteArrayInputStream(ByteArray(0)))
             }
             val url = uri.toString()
+            val headers = HashMap<String, String>(request.requestHeaders)
+            val cookie: String? = runCatching { CookieManager.getInstance().getCookie(url) }.getOrNull()
+            if (!cookie.isNullOrBlank()) headers["Cookie"] = cookie
+            // Thread IO du WebView : champs @Volatile uniquement
+            tab.sniffer.onRequest(url, headers, tab.currentUrl, tab.currentTitle)
+            return null
+        }
+
+        override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+            // Ne jamais bloquer les sous-frames (lecteurs iframe externes)
+            if (!request.isForMainFrame) return false
+            val uri = request.url
+            val scheme = uri.scheme?.lowercase()
+            if (scheme != "http" && scheme != "https") return true // intent://, market://, ...
+            val host = uri.host
+            if (AdBlocker.isAdHost(host)) return true
+
+            val curUrl = tab.currentUrl
+            if (curUrl.isBlank()) return false
+            val curHost = android.net.Uri.parse(curUrl).host
+            val now = System.currentTimeMillis()
+            return when {
+                AdBlocker.rootDomain(host) == AdBlocker.rootDomain(curHost) -> false
+                AdBlocker.isSearchEngine(curHost) -> false
+                now - tab.lastTypedAt < 5_000L -> false
+                now - tab.lastLinkClickAt < 3_000L -> false
+                else -> true
+            }
+        }
+
+        override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+            tab.url = url
+            tab.currentUrl = url
+            tab.loading = true
+            tab.progress = 0.05f
+            tab.scriptInjected = false
+            tab.videos.clear()
+            tab.sniffer.reset()
+            tab.canGoBack = view.canGoBack()
+            val batch = BatchSeriesManager.state.value
+            if (batch.config?.tabId != tab.id || batch.status == BatchStatus.IDLE) {
+                tab.lastClickedPlayer = ""
+            }
+        }
+
+        override fun onPageFinished(view: WebView, url: String) {
+            tab.loading = false
+            tab.progress = 1f
+            tab.canGoBack = view.canGoBack()
+            val t = view.title.orEmpty()
+            tab.title = t
+            tab.currentTitle = t
+            view.evaluateJavascript(AdBlocker.INJECTED_JS, null)
+            view.evaluateJavascript(PageAutomator.PLAYER_TRACKER_JS, null)
+            AppPrefs.addHistory(t, url)
+            BatchSeriesManager.onPageFinished(tab.id, url)
+        }
+
+        override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, errorResponse: WebResourceResponse) {
+            if (request.isForMainFrame) {
+                BatchSeriesManager.onHttpError(tab.id, errorResponse.statusCode)
+            }
+        }
+
+        override fun doUpdateVisitedHistory(view: WebView, url: String, isReload: Boolean) {
+            tab.url = url
+            tab.currentUrl = url
+            tab.canGoBack = view.canGoBack()
+        }
+    }
+
+    private fun findActivity(ctx: Context): Activity? {
+        var c: Context? = ctx
+        while (c is ContextWrapper) {
+            if (c is Activity) return c
+            c = c.baseContext
+        }
+        return null
+    }
+
+    /** Dialogue JS sécurisé : Activity valide obligatoire + garde `handled` contre le double confirm/cancel. */
+    private fun showJsDialog(view: WebView, message: String, withCancel: Boolean, result: JsResult, fallbackConfirm: Boolean): Boolean {
+        val act = findActivity(view.context)
+        var handled = false
+        fun once(block: () -> Unit) {
+            if (!handled) {
+                handled = true
+                runCatching(block)
+            }
+        }
+        if (act == null || act.isFinishing || act.isDestroyed) {
+            once { if (fallbackConfirm) result.confirm() else result.cancel() }
+            return true
+        }
+        try {
+            val b = AlertDialog.Builder(act)
+                .setMessage(message)
+                .setPositiveButton(android.R.string.ok) { _, _ -> once { result.confirm() } }
+                .setOnCancelListener { once { result.cancel() } }
+            if (withCancel) b.setNegativeButton(android.R.string.cancel) { _, _ -> once { result.cancel() } }
+            b.show()
+        } catch (e: Exception) {
+            once { if (fallbackConfirm) result.confirm() else result.cancel() }
+        }
+        return true
+    }
+
+    private fun buildChrome(tab: TabState) = object : WebChromeClient() {
+        override fun onProgressChanged(view: WebView, newProgress: Int) {
+            tab.progress = newProgress / 100f
+            tab.loading = newProgress < 100
+            if (newProgress >= 70 && !tab.scriptInjected) {
+                tab.scriptInjected = true
+                view.evaluateJavascript(AdBlocker.INJECTED_JS, null)
+                view.evaluateJavascript(PageAutomator.PLAYER_TRACKER_JS, null)
+            }
+        }
+
+        override fun onReceivedTitle(view: WebView, title: String?) {
+            tab.title = title.orEmpty()
+            tab.currentTitle = title.orEmpty()
+        }
+
+        // Neutralise 100 % des fenêtres publicitaires : on ne charge JAMAIS l'URL demandée.
+        override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean = false
+
+        override fun onJsAlert(view: WebView, url: String?, message: String?, result: JsResult): Boolean =
+            showJsDialog(view, message.orEmpty(), false, result, fallbackConfirm = false)
+
+        override fun onJsConfirm(view: WebView, url: String?, message: String?, result: JsResult): Boolean =
+            showJsDialog(view, message.orEmpty(), true, result, fallbackConfirm = false)
+
+        override fun onJsBeforeUnload(view: WebView, url: String?, message: String?, result: JsResult): Boolean =
+            showJsDialog(view, message.orEmpty(), true, result, fallbackConfirm = true)
+
+        override fun onShowCustomView(view: View, callback: CustomViewCallback) {
+            tab.customView = view
+            tab.customCallback = callback
+        }
+
+        override fun onHideCustomView() {
+            tab.customView = null
+            tab.customCallback?.onCustomViewHidden()
+            tab.customCallback = null
+        }
+    }
+}    val url = uri.toString()
             val headers = HashMap<String, String>(request.requestHeaders)
             val cookie: String? = runCatching { CookieManager.getInstance().getCookie(url) }.getOrNull()
             if (!cookie.isNullOrBlank()) headers["Cookie"] = cookie
