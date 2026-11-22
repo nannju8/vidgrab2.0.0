@@ -70,6 +70,7 @@ fun BatchSetupDialog(
     }
     var detectedPad by remember { mutableIntStateOf(if (bestIdx >= 0) matches[bestIdx].padWidth else 1) }
     var zeroPad by remember { mutableStateOf(detectedPad > 1) }
+    var fastMode by remember { mutableStateOf(true) }
     var quality by remember { mutableStateOf(initialQuality) }
     var playersText by remember {
         val base = listOfNotNull(tab.lastClickedPlayer.takeIf { it.isNotBlank() }, "voe", "vidmoly", "doodstream", "filemoon", "sibnet")
@@ -96,7 +97,7 @@ fun BatchSetupDialog(
                 style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Black, brush = VG.brand)
             )
             Text(
-                "Enchaîne automatiquement les épisodes, sélectionne le lecteur, clique Play et télécharge.",
+                "Tourne dans un onglet Robot dédié : vous pouvez naviguer ailleurs pendant la détection.",
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 4.dp)
@@ -176,6 +177,22 @@ fun BatchSetupDialog(
                 Switch(checked = zeroPad, onCheckedChange = { zeroPad = it })
             }
 
+            Row(
+                Modifier.fillMaxWidth().clickable { fastMode = !fastMode },
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("Mode rapide (tout détecter maintenant)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        if (fastMode) "Enchaîne toute la série en ~30 s, puis vous pouvez quitter l'app."
+                        else "Attend une place libre avant de détecter l'épisode suivant.",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(checked = fastMode, onCheckedChange = { fastMode = it })
+            }
+
             Spacer(Modifier.height(6.dp))
             Text("Qualité préférée", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
             Row(
@@ -227,7 +244,8 @@ fun BatchSetupDialog(
                                 endEp = endNum,
                                 padWidth = padWidth,
                                 targetQuality = quality,
-                                preferredPlayers = playersText.split(',').map { it.trim() }.filter { it.isNotBlank() }
+                                preferredPlayers = playersText.split(',').map { it.trim() }.filter { it.isNotBlank() },
+                                fastMode = fastMode
                             )
                             onStart(cfg)
                         }
