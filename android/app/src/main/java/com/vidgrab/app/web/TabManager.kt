@@ -45,6 +45,7 @@ class TabState(val id: Int, val isBatchTab: Boolean = false) {
     @Volatile var lastTypedAt: Long = 0L
     @Volatile var lastLinkClickAt: Long = 0L
     @Volatile var lastClickedPlayer: String = ""
+    @Volatile var lastSubframeAt: Long = 0L
 
     var url by mutableStateOf("")
     var title by mutableStateOf("")
@@ -64,9 +65,9 @@ class TabState(val id: Int, val isBatchTab: Boolean = false) {
 
     private val main = Handler(Looper.getMainLooper())
 
-    val sniffer = VideoSniffer { v ->
+    val sniffer: VideoSniffer = VideoSniffer { v, gen ->
         main.post {
-            if (videos.none { it.url == v.url }) {
+            if (sniffer.isCurrent(gen) && videos.none { it.url == v.url }) {
                 videos.add(v)
                 BatchSeriesManager.onVideoDetected(id, v)
             }
@@ -127,7 +128,6 @@ object TabManager {
         CookieManager.getInstance().setAcceptCookie(true)
     }
 
-    // ---- Cycle de vie Activity (MutableContextWrapper) -------------------------------------
     fun attachActivity(activity: Activity) {
         activityRef = WeakReference(activity)
         wrappers.forEach { it.baseContext = activity }
@@ -138,7 +138,6 @@ object TabManager {
         wrappers.forEach { if (it.baseContext === activity) it.baseContext = appContext }
     }
 
-    // ---- Onglets ---------------------------------------------------------------------------
     fun openNewTab(): TabState {
         val t = TabState(nextId++)
         tabs.add(t)
@@ -146,7 +145,6 @@ object TabManager {
         return t
     }
 
-    /** Ouvre un onglet dédié au robot sans interrompre l'onglet que regarde l'utilisateur. */
     fun openBackgroundTab(from: TabState): TabState {
         val t = TabState(nextId++, isBatchTab = true).apply {
             desktop = from.desktop
@@ -182,7 +180,6 @@ object TabManager {
         currentIndex = currentIndex.coerceIn(0, tabs.lastIndex)
     }
 
-    // ---- Navigation ------------------------------------------------------------------------
     fun normalize(input: String): String {
         val t = input.trim()
         if (t.startsWith("http://") || t.startsWith("https://")) return t
@@ -196,6 +193,7 @@ object TabManager {
         if (input.isBlank()) return
         val url = normalize(input)
         tab.lastTypedAt = System.currentTimeMillis()
+        tab.lastSubframeAt = 0L
         tab.url = url
         tab.currentUrl = url
         tab.loading = true
@@ -214,6 +212,7 @@ object TabManager {
         tab.loading = false
         tab.progress = 0f
         tab.videos.clear()
+        tab.sniffer.reset()
     }
 
     fun reload(tab: TabState) {
@@ -233,7 +232,6 @@ object TabManager {
         wv?.reload()
     }
 
-    /** Efface cookies, cache, stockage web et historique de navigation. */
     fun clearAll() {
         CookieManager.getInstance().removeAllCookies(null)
         CookieManager.getInstance().flush()
@@ -264,7 +262,6 @@ object TabManager {
         s.loadWithOverviewMode = tab.desktop
     }
 
-    // ---- Création du WebView avec contexte d'Activity ---------------------------------------
     @SuppressLint("SetJavaScriptEnabled")
     fun webViewFor(tab: TabState): WebView {
         tab.webView?.let { return it }
@@ -306,8 +303,11 @@ object TabManager {
         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
             val uri = request.url
             val host = uri.host
-            if (!request.isForMainFrame && AdBlocker.isAdHost(host)) {
-                return WebResourceResponse("text/plain", "utf-8", 200, "OK", emptyMap(), ByteArrayInputStream(ByteArray(0)))
+            if (!request.isForMainFrame) {
+                if (AdBlocker.isAdHost(host)) {
+                    return WebResourceResponse("text/plain", "utf-8", 200, "OK", emptyMap(), ByteArrayInputStream(ByteArray(0)))
+                }
+                tab.lastSubframeAt = System.currentTimeMillis()
             }
             val url = uri.toString()
             val headers = HashMap<String, String>(request.requestHeaders)
@@ -344,6 +344,7 @@ object TabManager {
             tab.loading = true
             tab.progress = 0.05f
             tab.scriptInjected = false
+            tab.lastSubframeAt = 0L
             tab.videos.clear()
             tab.sniffer.reset()
             tab.canGoBack = view.canGoBack()
@@ -362,8 +363,10 @@ object TabManager {
             tab.currentTitle = t
             view.evaluateJavascript(AdBlocker.INJECTED_JS, null)
             view.evaluateJavascript(PageAutomator.PLAYER_TRACKER_JS, null)
-            if (!tab.isBatchTab) AppPrefs.addHistory(t, url)
-            BatchSeriesManager.onPageFinished(tab.id, url)
+            if (url != "about:blank") {
+                if (!tab.isBatchTab) AppPrefs.addHistory(t, url)
+                BatchSeriesManager.onPageFinished(tab.id, url)
+            }
         }
 
         override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, errorResponse: WebResourceResponse) {
