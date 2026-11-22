@@ -17,17 +17,20 @@ import com.vidgrab.app.MainActivity
 import com.vidgrab.app.R
 import com.vidgrab.app.data.DlStatus
 import com.vidgrab.app.data.Format
+import com.vidgrab.app.transfer.TransferManager
+import com.vidgrab.app.transfer.TransferRole
+import com.vidgrab.app.transfer.TransferStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.conflate
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 
 /**
- * ForegroundService (dataSync) : notification de progression + PARTIAL_WAKE_LOCK + WifiLock (HIGH_PERF).
- * Les verrous sont revérifiés à chaque itération de la boucle active.
+ * ForegroundService (dataSync) : maintient les téléchargements en ligne ET les transferts Wi-Fi hors ligne
+ * avec notification de progression + PARTIAL_WAKE_LOCK + WifiLock (HIGH_PERF).
  */
 @Suppress("DEPRECATION")
 class DownloadService : Service() {
@@ -50,26 +53,41 @@ class DownloadService : Service() {
         wifi = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "vidgrab:wifi").apply { setReferenceCounted(false) }
 
         ServiceCompat.startForeground(
-            this, NOTIF_ID, buildNotification(0, 0L, 0),
+            this, NOTIF_ID, buildNotification("Préparation…", 0, indeterminate = true, showPause = false),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
         )
         scope.launch {
-            DownloadCenter.tasks.collect { list ->
+            combine(DownloadCenter.tasks, TransferManager.state) { list, tx -> list to tx }.collect { (list, tx) ->
                 val active = list.filter {
                     it.status == DlStatus.RUNNING || it.status == DlStatus.QUEUED || it.status == DlStatus.MERGING
                 }
-                if (active.isEmpty()) {
+                val txRunning = tx.status == TransferStatus.TRANSFERRING
+
+                if (active.isEmpty() && !txRunning) {
                     releaseLocks()
                     ServiceCompat.stopForeground(this@DownloadService, ServiceCompat.STOP_FOREGROUND_REMOVE)
                     stopSelf()
                     return@collect
                 }
                 holdLocks()
-                val speed: Long = active.sumOf { it.speedBps }
-                val total: Long = active.sumOf { it.total }
-                val done: Long = active.sumOf { it.downloaded }
-                val pct: Int = if (total > 0L) ((done * 100L) / total).toInt().coerceIn(0, 100) else 0
-                nm.notify(NOTIF_ID, buildNotification(active.size, speed, pct))
+
+                if (active.isNotEmpty()) {
+                    val speed: Long = active.sumOf { it.speedBps }
+                    val total: Long = active.sumOf { it.total }
+                    val done: Long = active.sumOf { it.downloaded }
+                    val pct: Int = if (total > 0L) ((done * 100L) / total).toInt().coerceIn(0, 100) else 0
+                    val title = if (active.size <= 1) "Téléchargement en cours" else "${active.size} téléchargements en cours"
+                    nm.notify(NOTIF_ID, buildNotification("$title • $pct % • ${Format.speed(speed)}", pct, false, true))
+                } else {
+                    val total = tx.totalBytes
+                    val done = tx.transferredBytes
+                    val pct: Int = if (total > 0L) ((done * 100L) / total).toInt().coerceIn(0, 100) else 0
+                    val verb = if (tx.role == TransferRole.SENDING) "Envoi Wi-Fi" else "Réception Wi-Fi"
+                    nm.notify(
+                        NOTIF_ID,
+                        buildNotification("$verb (${tx.completedFiles}/${tx.totalFiles}) • $pct % • ${Format.speed(tx.speedBps)}", pct, false, false)
+                    )
+                }
                 delay(1000L)
             }
         }
@@ -80,9 +98,9 @@ class DownloadService : Service() {
         return START_NOT_STICKY
     }
 
-    /** Android 15 : limite de 6 h pour les services dataSync. */
     override fun onTimeout(startId: Int, fgsType: Int) {
         DownloadCenter.pauseAll(interrupted = true)
+        TransferManager.stop()
         releaseLocks()
         stopSelf()
     }
@@ -103,26 +121,27 @@ class DownloadService : Service() {
         runCatching { if (wifi.isHeld) wifi.release() }
     }
 
-    private fun buildNotification(count: Int, speed: Long, pct: Int): Notification {
+    private fun buildNotification(text: String, pct: Int, indeterminate: Boolean, showPause: Boolean): Notification {
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val pause = PendingIntent.getService(
-            this, 1, Intent(this, DownloadService::class.java).setAction(ACTION_PAUSE_ALL),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        val title = if (count <= 1) "Téléchargement en cours" else "$count téléchargements en cours"
-        return NotificationCompat.Builder(this, CHANNEL)
+        val b = NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_download)
-            .setContentTitle(title)
-            .setContentText(if (count == 0) "Préparation…" else "$pct % • ${Format.speed(speed)}")
-            .setProgress(100, pct, count == 0)
+            .setContentTitle("VidGrab")
+            .setContentText(text)
+            .setProgress(100, pct, indeterminate)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setContentIntent(open)
-            .addAction(0, "Tout mettre en pause", pause)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-            .build()
+        if (showPause) {
+            val pause = PendingIntent.getService(
+                this, 1, Intent(this, DownloadService::class.java).setAction(ACTION_PAUSE_ALL),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            b.addAction(0, "Tout mettre en pause", pause)
+        }
+        return b.build()
     }
 
     companion object {
