@@ -15,7 +15,8 @@ data class DetectedVideo(
     val resolution: String,
     val pageUrl: String,
     /** En-têtes exacts de la requête d'origine (Referer, Origin, User-Agent, Cookie). */
-    val headers: Map<String, String>
+    val headers: Map<String, String>,
+    val durationSec: Double = 0.0
 )
 
 enum class DlStatus { QUEUED, RUNNING, PAUSED, WAITING_WIFI, MERGING, DONE, FAILED, CANCELED }
@@ -48,23 +49,7 @@ data class LibraryItem(
     val isPrivate: Boolean,
     val file: File?
 )
-// Dans DetectedVideo, ajouter le dernier paramètre avec valeur par défaut :
-data class DetectedVideo(
-    val id: String,
-    val url: String,
-    val title: String,
-    /** "MP4", "HLS", "WEBM", "MKV" */
-    val format: String,
-    val sizeBytes: Long,
-    /** "480p", "720p", "1080p" ou "Auto" */
-    val resolution: String,
-    val pageUrl: String,
-    /** En-têtes exacts de la requête d'origine (Referer, Origin, User-Agent, Cookie). */
-    val headers: Map<String, String>,
-    val durationSec: Double = 0.0
-)
 
-// À ajouter à la fin de Models.kt :
 enum class BatchStatus { IDLE, WAITING_SLOT, LOADING_PAGE, AUTOMATING, NEEDS_USER, PAUSED, DONE }
 
 data class BatchConfig(
