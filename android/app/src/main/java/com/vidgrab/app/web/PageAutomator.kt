@@ -68,7 +68,7 @@ object PageAutomator {
         return evalJs(wv, js) == "1"
     }
 
-    /** Clique sur le bouton de lecteur correspondant en priorité à [preferred] (sinon un lecteur non encore testé). */
+    /** Clique sur le bouton de lecteur correspondant en priorité à [preferred]. */
     suspend fun selectPlayer(wv: WebView, preferred: List<String>): String? {
         val kwArray = JSONArray(preferred.map { it.trim().lowercase() }.filter { it.isNotBlank() }).toString()
         val js = """
@@ -121,7 +121,8 @@ object PageAutomator {
     }
 
     /** Cherche un <video> direct ou le plus grand <iframe> lecteur et renvoie son centre à l'écran. */
-    suspend fun findPlayerTarget(wv: WebView): PlayerTarget? {
+    suspend fun findPlayerTarget(wv: WebView, muteVideo: Boolean = true): PlayerTarget? {
+        val muteFlag = if (muteVideo) "true" else "false"
         val js = """
 (function(){
   try {
@@ -133,7 +134,7 @@ object PageAutomator {
       var r = v.getBoundingClientRect();
       if (r.width >= 160 && r.height >= 100 && r.width * r.height > bestArea) {
         best = v; bestArea = r.width * r.height;
-        try { v.muted = false; v.play(); } catch(e){}
+        try { v.muted = $muteFlag; v.play(); } catch(e){}
       }
     }
     if (!best) {
