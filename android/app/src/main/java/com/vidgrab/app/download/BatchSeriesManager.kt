@@ -26,7 +26,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
-/** Orchestrateur du Mode Série : tourne dans un onglet Robot dédié, détecte en mode réactif et alerte à la fin. */
+/** Orchestrateur du Mode Série : jeton par épisode, reprise auto après Cloudflare, attente 4G sur iframe. */
 object BatchSeriesManager {
 
     private const val CHANNEL_ALERTS = "batch_alerts"
@@ -42,6 +42,7 @@ object BatchSeriesManager {
 
     private var consecutiveNotFound = 0
     private var currentEpisodeHandled = false
+    private var episodeToken = 0L
     private var channelCreated = false
 
     fun start(config: BatchConfig) {
@@ -49,6 +50,7 @@ object BatchSeriesManager {
         stop()
         consecutiveNotFound = 0
         currentEpisodeHandled = false
+        episodeToken++
 
         val total = (config.endEp - config.startEp + 1).coerceAtLeast(1)
         var firstRobotEp = config.startEp
@@ -68,13 +70,7 @@ object BatchSeriesManager {
 
         if (firstRobotEp > config.endEp) {
             val msg = "Détection terminée : $initialCompleted/$total épisode(s) en file"
-            _state.value = BatchState(
-                status = BatchStatus.DONE,
-                currentEp = config.endEp,
-                totalEps = total,
-                completedCount = initialCompleted,
-                message = msg
-            )
+            _state.value = BatchState(BatchStatus.DONE, null, config.endEp, total, msg, initialCompleted)
             DownloadCenter.events.tryEmit(msg)
             notifyBatch("Détection terminée", msg)
             return
@@ -82,7 +78,6 @@ object BatchSeriesManager {
 
         val robotTab = TabManager.openBackgroundTab(sourceTab)
         val robotConfig = config.copy(tabId = robotTab.id)
-
         _state.value = BatchState(
             status = BatchStatus.LOADING_PAGE,
             config = robotConfig,
@@ -97,6 +92,7 @@ object BatchSeriesManager {
     fun pause() {
         val st = _state.value
         if (st.status == BatchStatus.IDLE || st.status == BatchStatus.DONE) return
+        episodeToken++
         episodeJob?.cancel()
         collectJob?.cancel()
         runnerJob?.cancel()
@@ -109,7 +105,7 @@ object BatchSeriesManager {
         if (st.status != BatchStatus.PAUSED && st.status != BatchStatus.NEEDS_USER) return
         val tab = findTab(cfg.tabId) ?: run { stop(); return }
         if (tab.videos.any { isLikelyEpisode(it) }) {
-            schedulePickFromTab(tab, cfg, st.currentEp, immediate = true)
+            schedulePickFromTab(tab, cfg, st.currentEp, episodeToken, immediate = true)
             return
         }
         _state.value = st.copy(status = BatchStatus.LOADING_PAGE, message = "Reprise à l'épisode ${st.currentEp}…")
@@ -119,6 +115,7 @@ object BatchSeriesManager {
     fun skipCurrent() {
         val st = _state.value
         if (st.config == null || st.status == BatchStatus.IDLE || st.status == BatchStatus.DONE) return
+        episodeToken++
         episodeJob?.cancel()
         collectJob?.cancel()
         runnerJob?.cancel()
@@ -127,6 +124,7 @@ object BatchSeriesManager {
     }
 
     fun stop() {
+        episodeToken++
         episodeJob?.cancel()
         collectJob?.cancel()
         runnerJob?.cancel()
@@ -145,16 +143,18 @@ object BatchSeriesManager {
     }
 
     fun onPageFinished(tabId: Int, url: String) {
+        if (url == "about:blank") return
         val st = _state.value
         val cfg = st.config ?: return
-        if (cfg.tabId != tabId || st.status != BatchStatus.LOADING_PAGE || currentEpisodeHandled) return
+        if (cfg.tabId != tabId || currentEpisodeHandled) return
+        if (st.status != BatchStatus.LOADING_PAGE && st.status != BatchStatus.NEEDS_USER) return
         val tab = findTab(tabId) ?: return
 
         if (tab.videos.any { isLikelyEpisode(it) }) {
-            schedulePickFromTab(tab, cfg, st.currentEp, immediate = false)
+            schedulePickFromTab(tab, cfg, st.currentEp, episodeToken, immediate = false)
             return
         }
-        startPageAutomation(tab, cfg, st.currentEp)
+        startPageAutomation(tab, cfg, st.currentEp, episodeToken, quietIfBlocked = (st.status == BatchStatus.NEEDS_USER))
     }
 
     fun onHttpError(tabId: Int, code: Int) {
@@ -164,14 +164,12 @@ object BatchSeriesManager {
 
         if (code == 404 || code == 410) {
             consecutiveNotFound++
+            episodeToken++
             episodeJob?.cancel()
             collectJob?.cancel()
             _state.value = st.copy(failedEps = st.failedEps + st.currentEp)
-            if (consecutiveNotFound >= 2) {
-                finishBatch("Arrêt auto : épisodes introuvables (HTTP $code)")
-            } else {
-                advanceToNext()
-            }
+            if (consecutiveNotFound >= 2) finishBatch("Arrêt auto : épisodes introuvables (HTTP $code)")
+            else advanceToNext()
         } else if (code == 403 || code == 503 || code == 429) {
             episodeJob?.cancel()
             val msg = "Ép. ${st.currentEp} : vérification Cloudflare (HTTP $code) requise"
@@ -191,7 +189,7 @@ object BatchSeriesManager {
         if (!isLikelyEpisode(video)) return
 
         val tab = findTab(tabId) ?: return
-        schedulePickFromTab(tab, cfg, st.currentEp, immediate = false, lastVideo = video)
+        schedulePickFromTab(tab, cfg, st.currentEp, episodeToken, immediate = false, lastVideo = video)
     }
 
     private fun scheduleNextEpisode(tab: TabState, cfg: BatchConfig, ep: Int) {
@@ -214,6 +212,7 @@ object BatchSeriesManager {
     }
 
     private fun loadEpisode(tab: TabState, cfg: BatchConfig, ep: Int) {
+        episodeToken++
         episodeJob?.cancel()
         collectJob?.cancel()
         currentEpisodeHandled = false
@@ -226,52 +225,70 @@ object BatchSeriesManager {
         TabManager.load(tab, url)
     }
 
-    private fun startPageAutomation(tab: TabState, cfg: BatchConfig, ep: Int) {
+    private fun startPageAutomation(tab: TabState, cfg: BatchConfig, ep: Int, token: Long, quietIfBlocked: Boolean = false) {
         val wv = tab.webView ?: return
         episodeJob?.cancel()
         episodeJob = scope.launch {
-            _state.value = _state.value.copy(
-                status = BatchStatus.AUTOMATING,
-                message = "Ép. $ep/${cfg.endEp} : recherche du lecteur…"
-            )
-            delay(300L)
-            if (currentEpisodeHandled || !isActive) return@launch
+            if (token != episodeToken || currentEpisodeHandled || !isActive) return@launch
+            delay(350L)
+            if (token != episodeToken || currentEpisodeHandled || !isActive) return@launch
 
             if (PageAutomator.isBlockedByChallenge(wv)) {
                 val msg = "Ép. $ep : passez Cloudflare puis lancez la lecture"
                 _state.value = _state.value.copy(status = BatchStatus.NEEDS_USER, message = msg)
-                notifyBatch("Cloudflare détecté", msg)
+                if (!quietIfBlocked) notifyBatch("Cloudflare détecté", msg)
                 return@launch
             }
 
+            _state.value = _state.value.copy(
+                status = BatchStatus.AUTOMATING,
+                message = "Ép. $ep/${cfg.endEp} : recherche du lecteur…"
+            )
+
             val prefs = buildPlayerPriority(tab, cfg)
+            var playerSwitched = false
             for (step in 0 until 8) {
-                if (currentEpisodeHandled || !isActive) return@launch
+                if (token != episodeToken || currentEpisodeHandled || !isActive) return@launch
                 if (tab.videos.any { isLikelyEpisode(it) }) {
-                    schedulePickFromTab(tab, cfg, ep, immediate = true)
+                    schedulePickFromTab(tab, cfg, ep, token, immediate = true)
                     return@launch
                 }
-                val clickedPlayer = PageAutomator.selectPlayer(wv, prefs)
-                if (clickedPlayer != null) {
-                    _state.value = _state.value.copy(message = "Ép. $ep : lecteur « $clickedPlayer »…")
-                    delay(550L)
+                val clicked = PageAutomator.selectPlayer(wv, prefs)
+                if (clicked != null) {
+                    playerSwitched = true
+                    _state.value = _state.value.copy(message = "Ép. $ep : lecteur « $clicked »…")
                     break
                 }
                 if (step >= 1 && PageAutomator.findPlayerTarget(wv, muteVideo = true) != null) break
                 delay(250L)
             }
 
+            // Laisse le temps à l'iframe distante de charger ses scripts sur 4G après le choix de lecteur
+            if (playerSwitched) {
+                delay(900L)
+                for (s in 0 until 10) {
+                    if (token != episodeToken || currentEpisodeHandled || !isActive) return@launch
+                    if (tab.videos.any { isLikelyEpisode(it) }) {
+                        schedulePickFromTab(tab, cfg, ep, token, immediate = false)
+                        return@launch
+                    }
+                    val quietFor = System.currentTimeMillis() - tab.lastSubframeAt
+                    if (tab.lastSubframeAt > 0L && quietFor >= 700L && PageAutomator.findPlayerTarget(wv, muteVideo = true) != null) break
+                    delay(250L)
+                }
+            }
+
             for (attempt in 1..3) {
-                if (currentEpisodeHandled || !isActive) return@launch
+                if (token != episodeToken || currentEpisodeHandled || !isActive) return@launch
                 if (tab.videos.any { isLikelyEpisode(it) }) {
-                    schedulePickFromTab(tab, cfg, ep, immediate = true)
+                    schedulePickFromTab(tab, cfg, ep, token, immediate = true)
                     return@launch
                 }
                 var target: PageAutomator.PlayerTarget? = null
-                for (w in 0 until 10) {
-                    if (currentEpisodeHandled || !isActive) return@launch
+                for (w in 0 until 12) {
+                    if (token != episodeToken || currentEpisodeHandled || !isActive) return@launch
                     if (tab.videos.any { isLikelyEpisode(it) }) {
-                        schedulePickFromTab(tab, cfg, ep, immediate = true)
+                        schedulePickFromTab(tab, cfg, ep, token, immediate = true)
                         return@launch
                     }
                     target = PageAutomator.findPlayerTarget(wv, muteVideo = true)
@@ -282,10 +299,10 @@ object BatchSeriesManager {
                     _state.value = _state.value.copy(message = "Ép. $ep : Play ($attempt/3)…")
                     PageAutomator.tapWebView(wv, target)
                 }
-                for (r in 0 until 8) {
-                    if (currentEpisodeHandled || !isActive) return@launch
+                for (r in 0 until 12) { // jusqu'à 3 s par tap sur 4G, sortie immédiate dès qu'un flux arrive
+                    if (token != episodeToken || currentEpisodeHandled || !isActive) return@launch
                     if (tab.videos.any { isLikelyEpisode(it) }) {
-                        schedulePickFromTab(tab, cfg, ep, immediate = false)
+                        schedulePickFromTab(tab, cfg, ep, token, immediate = false)
                         return@launch
                     }
                     delay(250L)
@@ -298,17 +315,17 @@ object BatchSeriesManager {
                 }
             }
 
-            if (!currentEpisodeHandled && isActive) {
+            if (token == episodeToken && !currentEpisodeHandled && isActive) {
                 val fallback = PageAutomator.selectPlayer(wv, prefs)
                 if (fallback != null) {
                     _state.value = _state.value.copy(message = "Ép. $ep : essai « $fallback »…")
-                    delay(700L)
+                    delay(1400L)
                     val target = PageAutomator.findPlayerTarget(wv, muteVideo = true)
                     if (target != null) PageAutomator.tapWebView(wv, target)
-                    for (r in 0 until 12) {
-                        if (currentEpisodeHandled || !isActive) return@launch
+                    for (r in 0 until 14) {
+                        if (token != episodeToken || currentEpisodeHandled || !isActive) return@launch
                         if (tab.videos.any { isLikelyEpisode(it) }) {
-                            schedulePickFromTab(tab, cfg, ep, immediate = false)
+                            schedulePickFromTab(tab, cfg, ep, token, immediate = false)
                             return@launch
                         }
                         delay(250L)
@@ -316,7 +333,7 @@ object BatchSeriesManager {
                 }
             }
 
-            if (!currentEpisodeHandled && isActive) {
+            if (token == episodeToken && !currentEpisodeHandled && isActive) {
                 val msg = "Ép. $ep : choisissez le lecteur et cliquez Play"
                 _state.value = _state.value.copy(status = BatchStatus.NEEDS_USER, message = msg)
                 notifyBatch("Action requise (Ép. $ep)", msg)
@@ -328,10 +345,11 @@ object BatchSeriesManager {
         tab: TabState,
         cfg: BatchConfig,
         ep: Int,
+        token: Long,
         immediate: Boolean,
         lastVideo: DetectedVideo? = null
     ) {
-        if (currentEpisodeHandled) return
+        if (token != episodeToken || currentEpisodeHandled) return
         collectJob?.cancel()
         collectJob = scope.launch {
             if (!immediate) {
@@ -342,12 +360,13 @@ object BatchSeriesManager {
                     )
                 delay(if (quickHit) 250L else 850L)
             }
-            if (currentEpisodeHandled) return@launch
+            if (token != episodeToken || currentEpisodeHandled) return@launch
 
             val valid = tab.videos.filter { isLikelyEpisode(it) }
             val best = pickBestVideo(valid, cfg.targetQuality) ?: return@launch
 
             currentEpisodeHandled = true
+            episodeToken++
             episodeJob?.cancel()
             consecutiveNotFound = 0
 
@@ -376,6 +395,7 @@ object BatchSeriesManager {
     }
 
     private fun finishBatch(msg: String) {
+        episodeToken++
         episodeJob?.cancel()
         collectJob?.cancel()
         runnerJob?.cancel()
@@ -421,9 +441,7 @@ object BatchSeriesManager {
 
     private fun pickBestVideo(videos: List<DetectedVideo>, targetQuality: String): DetectedVideo? {
         if (videos.isEmpty()) return null
-        if (targetQuality == "Meilleure") {
-            return videos.maxByOrNull { resolutionScore(it.resolution) }
-        }
+        if (targetQuality == "Meilleure") return videos.maxByOrNull { resolutionScore(it.resolution) }
         videos.firstOrNull { it.resolution.equals(targetQuality, ignoreCase = true) }?.let { return it }
         val targetPx = targetQuality.removeSuffix("p").toIntOrNull() ?: 720
         return videos.minByOrNull { kotlin.math.abs(resolutionScore(it.resolution) - targetPx) }
@@ -436,7 +454,7 @@ object BatchSeriesManager {
         val list = LinkedHashSet<String>()
         if (tab.lastClickedPlayer.isNotBlank()) list.add(tab.lastClickedPlayer)
         cfg.preferredPlayers.forEach { if (it.isNotBlank()) list.add(it.trim()) }
-        listOf("voe", "vidmoly", "doodstream", "dood", "filemoon", "sibnet", "streamtape", "uqload", "luluvdo", "sendvid", "lecteur", "player")
+        listOf("voe", "vidmoly", "doodstream", "dood", "filemoon", "sibnet", "streamtape", "uqload", "luluvdo", "sendvid", "myvi", "ok.ru", "netu", "waaw", "lecteur 1", "player 1")
             .forEach { list.add(it) }
         return list.toList()
     }
