@@ -22,12 +22,14 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Cancel
+import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.CloudDownload
 import androidx.compose.material.icons.rounded.Downloading
 import androidx.compose.material.icons.rounded.Pause
@@ -35,11 +37,15 @@ import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.WifiOff
+import androidx.compose.material.icons.rounded.WifiTethering
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -60,7 +66,12 @@ import com.vidgrab.app.data.DownloadTask
 import com.vidgrab.app.data.Format
 import com.vidgrab.app.download.BatchSeriesManager
 import com.vidgrab.app.download.DownloadCenter
+import com.vidgrab.app.transfer.TransferManager
+import com.vidgrab.app.transfer.TransferRole
+import com.vidgrab.app.transfer.TransferState
+import com.vidgrab.app.transfer.TransferStatus
 import com.vidgrab.app.ui.components.GlassCard
+import com.vidgrab.app.ui.components.GradientButton
 import com.vidgrab.app.ui.components.ScreenTitle
 import com.vidgrab.app.ui.components.ShimmerProgress
 import com.vidgrab.app.ui.components.bounceClick
@@ -70,14 +81,18 @@ import com.vidgrab.app.ui.theme.VG
 import kotlin.math.sin
 
 @Composable
-fun ProgressScreen() {
+fun ProgressScreen(onOpenTransfer: () -> Unit = {}) {
     val tasks by DownloadCenter.tasks.collectAsStateWithLifecycle()
     val blocked by DownloadCenter.wifiBlocked.collectAsStateWithLifecycle()
     val batch by BatchSeriesManager.state.collectAsStateWithLifecycle()
-    val speed: Long = tasks.filter { it.status == DlStatus.RUNNING }.sumOf { it.speedBps }
+    val tx by TransferManager.state.collectAsStateWithLifecycle()
+    var subTab by rememberSaveable { mutableIntStateOf(0) }
+
+    val onlineSpeed: Long = tasks.filter { it.status == DlStatus.RUNNING }.sumOf { it.speedBps }
+    val shownSpeed: Long = if (subTab == 0) onlineSpeed else tx.speedBps
 
     Column(Modifier.fillMaxSize().statusBarsPadding()) {
-        Row(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 18.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
             ScreenTitle("PROGRESSION")
             Spacer(Modifier.weight(1f))
             Row(
@@ -86,55 +101,140 @@ fun ProgressScreen() {
             ) {
                 Icon(Icons.Rounded.Speed, null, Modifier.size(16.dp), tint = VG.Cyan)
                 Spacer(Modifier.width(6.dp))
-                Text(Format.speed(speed), color = VG.Cyan, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                Text(Format.speed(shownSpeed), color = VG.Cyan, fontWeight = FontWeight.Bold, fontSize = 13.sp)
             }
         }
 
-        if (blocked) {
-            GlassCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp), glow = VG.Coral) {
-                Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Rounded.WifiOff, null, tint = VG.Coral)
-                    Spacer(Modifier.width(12.dp))
-                    Text(
-                        "Mode « Wi-Fi uniquement » actif : les téléchargements sont en attente. Ils reprendront automatiquement dès la connexion à un réseau Wi-Fi.",
-                        fontSize = 13.sp
-                    )
-                }
-            }
+        // Deux interfaces : En ligne | Hors ligne
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 20.dp).glass(RoundedCornerShape(50), VG.Indigo, 8.dp).padding(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            val txCount = if (tx.status != TransferStatus.IDLE) (tx.totalFiles - tx.completedFiles).coerceAtLeast(0) else 0
+            ProgressTabPill("En ligne (${tasks.size})", subTab == 0, Modifier.weight(1f)) { subTab = 0 }
+            ProgressTabPill("Hors ligne ($txCount)", subTab == 1, Modifier.weight(1f)) { subTab = 1 }
         }
+        Spacer(Modifier.height(8.dp))
 
-        if (batch.status != BatchStatus.IDLE) {
-            val done = batch.status == BatchStatus.DONE
-            GlassCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp), glow = if (done) VG.Indigo else VG.Cyan) {
-                Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Rounded.AutoAwesome, null, tint = if (done) VG.Indigo else VG.Cyan)
-                    Spacer(Modifier.width(12.dp))
-                    Column(Modifier.weight(1f)) {
+        if (subTab == 0) {
+            if (blocked) {
+                GlassCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp), glow = VG.Coral) {
+                    Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Rounded.WifiOff, null, tint = VG.Coral)
+                        Spacer(Modifier.width(12.dp))
                         Text(
-                            if (done) "Mode Série · Terminé (${batch.completedCount}/${batch.totalEps})"
-                            else "Mode Série · Ép. ${batch.currentEp}/${batch.config?.endEp ?: batch.totalEps}",
-                            fontWeight = FontWeight.Bold,
+                            "Mode « Wi-Fi uniquement » actif : les téléchargements sont en attente. Ils reprendront automatiquement dès la connexion à un réseau Wi-Fi.",
                             fontSize = 13.sp
                         )
-                        Text(batch.message, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    Text(
-                        if (done) "Fermer" else "Arrêter",
-                        color = VG.Coral,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 12.sp,
-                        modifier = Modifier.bounceClick { BatchSeriesManager.stop() }.padding(6.dp)
-                    )
+                }
+            }
+            if (batch.status != BatchStatus.IDLE) {
+                val done = batch.status == BatchStatus.DONE
+                GlassCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp), glow = if (done) VG.Indigo else VG.Cyan) {
+                    Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Rounded.AutoAwesome, null, tint = if (done) VG.Indigo else VG.Cyan)
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                if (done) "Mode Série · Terminé (${batch.completedCount}/${batch.totalEps})"
+                                else "Mode Série · Ép. ${batch.currentEp}/${batch.config?.endEp ?: batch.totalEps}",
+                                fontWeight = FontWeight.Bold, fontSize = 13.sp
+                            )
+                            Text(batch.message, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Text(
+                            if (done) "Fermer" else "Arrêter", color = VG.Coral, fontWeight = FontWeight.Bold, fontSize = 12.sp,
+                            modifier = Modifier.bounceClick { BatchSeriesManager.stop() }.padding(6.dp)
+                        )
+                    }
+                }
+            }
+            if (tasks.isEmpty()) EmptyState()
+            else LazyColumn(
+                contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 130.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                itemsIndexed(tasks, key = { _, t -> t.id }) { i, t -> TaskCard(t, Modifier.staggerIn(i)) }
+            }
+        } else {
+            OfflineProgressTab(tx, onOpenTransfer)
+        }
+    }
+}
+
+@Composable
+private fun ProgressTabPill(label: String, selected: Boolean, modifier: Modifier, onClick: () -> Unit) {
+    Box(
+        modifier.clip(RoundedCornerShape(50))
+            .background(if (selected) VG.brand else androidx.compose.ui.graphics.SolidColor(Color.Transparent))
+            .bounceClick(onClick = onClick)
+            .padding(vertical = 9.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(label, color = if (selected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+    }
+}
+
+@Composable
+private fun OfflineProgressTab(tx: TransferState, onOpenTransfer: () -> Unit) {
+    if (tx.status == TransferStatus.IDLE || tx.files.isEmpty()) {
+        Column(Modifier.fillMaxSize().padding(bottom = 120.dp, start = 28.dp, end = 28.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+            Icon(Icons.Rounded.WifiTethering, null, Modifier.size(64.dp), tint = VG.Cyan.copy(alpha = 0.7f))
+            Spacer(Modifier.height(14.dp))
+            Text("Aucun transfert hors ligne", fontWeight = FontWeight.Bold, fontSize = 17.sp)
+            Text(
+                "Transférez des vidéos entre deux VidGrab sans Internet à pleine vitesse Wi-Fi.",
+                textAlign = TextAlign.Center, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp, modifier = Modifier.padding(vertical = 8.dp)
+            )
+            Spacer(Modifier.height(10.dp))
+            GradientButton("Ouvrir Transfert", icon = Icons.Rounded.WifiTethering, onClick = onOpenTransfer)
+        }
+        return
+    }
+    val total = tx.totalBytes.coerceAtLeast(1L)
+    val frac = (tx.transferredBytes.toDouble() / total.toDouble()).toFloat().coerceIn(0f, 1f)
+    val remaining = (tx.totalFiles - tx.completedFiles).coerceAtLeast(0)
+    LazyColumn(contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 130.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        item {
+            GlassCard(Modifier.fillMaxWidth(), glow = VG.Cyan) {
+                Column(Modifier.padding(16.dp)) {
+                    val title = if (tx.role == TransferRole.SENDING) "Envoi vers ${tx.peerName.ifBlank { "l'appareil" }}" else "Réception depuis ${tx.peerName.ifBlank { "l'appareil" }}"
+                    Text(title, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    Text("$remaining fichier(s) restant(s) sur ${tx.totalFiles} · ${tx.message}", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.height(10.dp))
+                    ShimmerProgress(frac, active = tx.status == TransferStatus.TRANSFERRING)
+                    Spacer(Modifier.height(8.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("${Format.size(tx.transferredBytes)} / ${Format.size(tx.totalBytes)}", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("${Format.speed(tx.speedBps)} · reste ${Format.eta(tx.etaSec)}", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = VG.Cyan)
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text("Ouvrir Transfert", color = VG.Cyan, fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.bounceClick(onClick = onOpenTransfer).padding(4.dp))
+                        Spacer(Modifier.weight(1f))
+                        Text(
+                            if (tx.status == TransferStatus.DONE) "Fermer" else "Arrêter",
+                            color = VG.Coral, fontWeight = FontWeight.Bold, fontSize = 13.sp,
+                            modifier = Modifier.bounceClick { TransferManager.stop() }.padding(4.dp)
+                        )
+                    }
                 }
             }
         }
-
-        if (tasks.isEmpty()) EmptyState()
-        else LazyColumn(
-            contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 130.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
-        ) {
-            itemsIndexed(tasks, key = { _, t -> t.id }) { i, t -> TaskCard(t, Modifier.staggerIn(i)) }
+        items(tx.files, key = { it.index }) { f ->
+            val fFrac = if (f.sizeBytes > 0L) (f.transferredBytes.toDouble() / f.sizeBytes.toDouble()).toFloat().coerceIn(0f, 1f) else 0f
+            GlassCard(Modifier.fillMaxWidth(), glow = if (f.done) VG.Cyan else VG.Indigo) {
+                Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(if (f.done) Icons.Rounded.CheckCircle else Icons.Rounded.Downloading, null, tint = if (f.done) VG.Cyan else VG.Indigo, modifier = Modifier.size(22.dp))
+                    Spacer(Modifier.width(10.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("${f.name}.${f.ext}", maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        Text("${Format.size(f.transferredBytes)} / ${Format.size(f.sizeBytes)}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Text("${(fFrac * 100f).toInt()} %", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = VG.Cyan)
+                }
+            }
         }
     }
 }
@@ -189,10 +289,7 @@ private fun TaskCard(t: DownloadTask, modifier: Modifier) {
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
                     Text(t.video.title, maxLines = 2, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
-                    Text(
-                        "${t.video.format} · ${t.video.resolution}",
-                        fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    Text("${t.video.format} · ${t.video.resolution}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
             Spacer(Modifier.height(12.dp))
