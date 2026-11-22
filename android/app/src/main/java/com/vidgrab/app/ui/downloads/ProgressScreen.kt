@@ -250,34 +250,4 @@ private fun FlowIcon(active: Boolean) {
     ) {
         Icon(Icons.Rounded.Downloading, null, tint = Color.White, modifier = Modifier.size(26.dp).graphicsLayer { translationY = if (active) y else 0f })
     }
-}                      else -> RoundAction(Icons.Rounded.Pause, VG.Indigo) { DownloadCenter.pause(t.id) }
-                    }
-                    Spacer(Modifier.width(8.dp))
-                    RoundAction(Icons.Rounded.Cancel, VG.Coral) { DownloadCenter.cancel(t.id) }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun RoundAction(icon: ImageVector, tint: Color, onClick: () -> Unit) {
-    Box(
-        Modifier.size(38.dp).shadow(6.dp, CircleShape, ambientColor = tint, spotColor = tint)
-            .clip(CircleShape).background(tint.copy(alpha = 0.18f)).bounceClick(onClick = onClick),
-        contentAlignment = Alignment.Center
-    ) { Icon(icon, null, tint = tint, modifier = Modifier.size(20.dp)) }
-}
-
-/** Icône de flux animée : la flèche « coule » en boucle pendant le téléchargement. */
-@Composable
-private fun FlowIcon(active: Boolean) {
-    val t = rememberInfiniteTransition(label = "flow")
-    val y by t.animateFloat(-5f, 5f, infiniteRepeatable(tween(700), RepeatMode.Reverse), label = "y")
-    Box(
-        Modifier.size(46.dp).clip(RoundedCornerShape(14.dp)).background(VG.brand),
-        contentAlignment = Alignment.Center
-    ) {
-        Icon(Icons.Rounded.Downloading, null, tint = Color.White, modifier = Modifier.size(26.dp).graphicsLayer { translationY = if (active) y else 0f })
-    }
 }
