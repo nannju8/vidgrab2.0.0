@@ -37,6 +37,7 @@ import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.LockOpen
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.OpenInBrowser
+import androidx.compose.material.icons.rounded.PlaylistAdd
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.Star
@@ -56,7 +57,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -74,6 +74,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vidgrab.app.data.AppPrefs
+import com.vidgrab.app.download.BatchSeriesManager
 import com.vidgrab.app.ui.components.GlassIconButton
 import com.vidgrab.app.ui.components.bounceClick
 import com.vidgrab.app.ui.components.glass
@@ -90,6 +91,7 @@ fun WebScreen(tab: TabState, onOpenTabs: () -> Unit) {
     var editing by remember(tab.id) { mutableStateOf(false) }
     var text by remember(tab.id) { mutableStateOf("") }
     var menu by remember { mutableStateOf(false) }
+    var showBatch by remember(tab.id) { mutableStateOf(false) }
 
     Column(Modifier.fillMaxSize().statusBarsPadding()) {
         // ---- Barre supérieure ----
@@ -165,6 +167,11 @@ fun WebScreen(tab: TabState, onOpenTabs: () -> Unit) {
                 GlassIconButton(Icons.Rounded.MoreVert, "Menu") { menu = true }
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                     DropdownMenuItem(
+                        leadingIcon = { Icon(Icons.Rounded.PlaylistAdd, null, tint = VG.Cyan) },
+                        text = { Text("Mode Série (télécharger une suite)") },
+                        onClick = { menu = false; showBatch = true }
+                    )
+                    DropdownMenuItem(
                         leadingIcon = { Icon(Icons.Rounded.DesktopWindows, null) },
                         text = { Text("Version ordinateur") },
                         trailingIcon = { Switch(checked = tab.desktop, onCheckedChange = null) },
@@ -191,6 +198,66 @@ fun WebScreen(tab: TabState, onOpenTabs: () -> Unit) {
                     )
                     DropdownMenuItem(
                         leadingIcon = { Icon(Icons.Rounded.DeleteSweep, null, tint = VG.Coral) }, text = { Text("Tout effacer") },
+                        onClick = { menu = false; TabManager.clearAll() }
+                    )
+                }
+            }
+        }
+
+        // ---- Barre de progression lumineuse (Cyan → Indigo) ----
+        WebProgressBar(loading = tab.loading, progress = tab.progress)
+
+        // ---- Bandeau Mode Série ----
+        BatchBanner(tab.id)
+
+        // ---- WebView plein écran ----
+        Box(Modifier.weight(1f).fillMaxWidth().padding(bottom = 0.dp)) {
+            key(tab.id) {
+                AndroidView(
+                    factory = {
+                        val wv = TabManager.webViewFor(tab)
+                        (wv.parent as? ViewGroup)?.removeView(wv)
+                        wv
+                    },
+                    update = { it.onResume() },
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+            val custom = tab.customView
+            if (custom != null) {
+                AndroidView(
+                    factory = {
+                        (custom.parent as? ViewGroup)?.removeView(custom)
+                        custom
+                    },
+                    modifier = Modifier.fillMaxSize().background(Color.Black)
+                )
+            }
+        }
+    }
+
+    if (showBatch) {
+        BatchSetupDialog(
+            tab = tab,
+            onStart = { cfg -> showBatch = false; BatchSeriesManager.start(cfg) },
+            onDismiss = { showBatch = false }
+        )
+    }
+}
+
+@Composable
+private fun WebProgressBar(loading: Boolean, progress: Float) {
+    Box(Modifier.fillMaxWidth().height(3.dp)) {
+        AnimatedVisibility(visible = loading, enter = fadeIn(), exit = fadeOut()) {
+            val p by animateFloatAsState(progress.coerceIn(0.03f, 1f), label = "web-progress")
+            Box(
+                Modifier.fillMaxHeight().fillMaxWidth(p)
+                    .shadow(6.dp, RoundedCornerShape(50), ambientColor = VG.Cyan, spotColor = VG.Cyan)
+                    .background(VG.progressBrush)
+            )
+        }
+    }
+}Rounded.DeleteSweep, null, tint = VG.Coral) }, text = { Text("Tout effacer") },
                         onClick = { menu = false; TabManager.clearAll() }
                     )
                 }
