@@ -60,7 +60,8 @@ data class BatchConfig(
     val endEp: Int,
     val padWidth: Int,
     val targetQuality: String,
-    val preferredPlayers: List<String>
+    val preferredPlayers: List<String>,
+    val fastMode: Boolean = true
 )
 
 data class BatchState(
