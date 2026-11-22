@@ -104,20 +104,22 @@ fun ProgressScreen() {
         }
 
         if (batch.status != BatchStatus.IDLE) {
-            GlassCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp), glow = VG.Cyan) {
+            val done = batch.status == BatchStatus.DONE
+            GlassCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp), glow = if (done) VG.Indigo else VG.Cyan) {
                 Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Rounded.AutoAwesome, null, tint = VG.Cyan)
+                    Icon(Icons.Rounded.AutoAwesome, null, tint = if (done) VG.Indigo else VG.Cyan)
                     Spacer(Modifier.width(12.dp))
                     Column(Modifier.weight(1f)) {
                         Text(
-                            "Mode Série · Ép. ${batch.currentEp}/${batch.config?.endEp ?: "?"}",
+                            if (done) "Mode Série · Terminé (${batch.completedCount}/${batch.totalEps})"
+                            else "Mode Série · Ép. ${batch.currentEp}/${batch.config?.endEp ?: batch.totalEps}",
                             fontWeight = FontWeight.Bold,
                             fontSize = 13.sp
                         )
                         Text(batch.message, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     Text(
-                        "Arrêter",
+                        if (done) "Fermer" else "Arrêter",
                         color = VG.Coral,
                         fontWeight = FontWeight.Bold,
                         fontSize = 12.sp,
@@ -157,7 +159,6 @@ private fun EmptyState() {
                 contentAlignment = Alignment.Center
             ) { Icon(Icons.Rounded.CloudDownload, null, Modifier.size(56.dp), tint = Color.White) }
         }
-        // Ombre au sol qui respire avec la lévitation
         Box(
             Modifier.padding(top = 18.dp).width((90f - dy).dp).height(10.dp)
                 .background(Brush.radialGradient(listOf(VG.Indigo.copy(alpha = 0.35f), Color.Transparent)), CircleShape)
@@ -239,7 +240,6 @@ private fun RoundAction(icon: ImageVector, tint: Color, onClick: () -> Unit) {
     ) { Icon(icon, null, tint = tint, modifier = Modifier.size(20.dp)) }
 }
 
-/** Icône de flux animée : la flèche « coule » en boucle pendant le téléchargement. */
 @Composable
 private fun FlowIcon(active: Boolean) {
     val t = rememberInfiniteTransition(label = "flow")
