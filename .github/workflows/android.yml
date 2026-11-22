@@ -4,7 +4,7 @@ on:
   push:
     branches: [ main, master ]
     tags: [ 'v*' ]
-  workflow_dispatch: # Permet de lancer le robot manuellement d'un clic sur GitHub
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -41,12 +41,13 @@ jobs:
             gradle assembleDebug --no-daemon
           fi
 
-      - name: Mettre l'APK en téléchargement (Artifact)
+      - name: Mettre l'APK en téléchargement (Archive ZIP ~17 Mo)
         uses: actions/upload-artifact@v7
         with:
           name: VidGrab-debug
           path: android/app/build/outputs/apk/debug/app-debug.apk
-          archive: false
+          archive: true
+          compression-level: 9
           retention-days: 30
 
       - name: Publier une GitHub Release (si tag v*)
