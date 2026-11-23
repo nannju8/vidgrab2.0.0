@@ -8,10 +8,31 @@ import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.coroutines.resume
 
-/** Automatisation WebView : sélection de lecteur (<select> + boutons), détection Cloudflare sans faux positifs et tap Play. */
+/**
+ * Automatisation WebView :
+ * - Découverte universelle des lecteurs (<select> hors langue + groupes de boutons autour du lecteur)
+ * - Détection Cloudflare sur la page principale
+ * - Coordonnées précises du <video> ou <iframe> pour un tap ciblé (relX, relY)
+ */
 object PageAutomator {
 
-    data class PlayerTarget(val cx: Float, val cy: Float, val innerW: Float, val innerH: Float)
+    data class PlayerOption(
+        val id: String,
+        val label: String,
+        val isSelected: Boolean
+    )
+
+    data class PlayerTarget(
+        val left: Float,
+        val top: Float,
+        val width: Float,
+        val height: Float,
+        val cx: Float,
+        val cy: Float,
+        val innerW: Float,
+        val innerH: Float,
+        val isDirectVideo: Boolean
+    )
 
     val PLAYER_TRACKER_JS: String = """
 (function(){
@@ -38,7 +59,9 @@ object PageAutomator {
       if (!s || s.tagName !== 'SELECT') return;
       var opt = s.options && s.options[s.selectedIndex];
       var txt = opt ? (opt.textContent || '').trim() : '';
-      if (txt.length >= 2 && txt.length <= 32 && hosts.test(txt)) VidGrab.onPlayerClicked(txt);
+      if (txt.length >= 2 && txt.length <= 32 && !/^(vf|vostfr|vo|fr|eng|all)$/i.test(txt)) {
+        VidGrab.onPlayerClicked(txt);
+      }
     } catch(e){}
   }, true);
 })();
@@ -59,7 +82,7 @@ object PageAutomator {
             }
         }
 
-    /** Détecte uniquement un vrai blocage Cloudflare / Captcha qui empêche la page vidéo d'exister. */
+    /** Détecte uniquement un vrai blocage Cloudflare / Captcha sur la page principale. */
     suspend fun isBlockedByChallenge(wv: WebView): Boolean {
         val js = """
 (function(){
@@ -91,96 +114,227 @@ object PageAutomator {
         return evalJs(wv, js) == "1"
     }
 
-    /** Sélectionne le lecteur préféré via <select> ou bouton/onglet cliquable (jamais un conteneur parent). */
-    suspend fun selectPlayer(wv: WebView, preferred: List<String>): String? {
-        val kwArray = JSONArray(preferred.map { it.trim().lowercase() }.filter { it.isNotBlank() }).toString()
+    /**
+     * Découvre tous les lecteurs disponibles sur la page dans l'ordre naturel du site (1er -> dernier) :
+     * 1) Menus <select> de lecteurs (en ignorant les menus purement langue VF/VOSTFR ou épisodes)
+     * 2) Le meilleur groupe de boutons/onglets de serveurs autour du lecteur vidéo.
+     */
+    suspend fun discoverPlayers(wv: WebView): List<PlayerOption> {
         val js = """
 (function(){
   try {
-    var prefs = $kwArray;
+    var out = [];
+    var langOnly = /^(vf|vostfr|vo|vf\s*\d*|vostfr\s*\d*|french|english|eng|sub|dub|raw|all|tous|langue|language|qualit[eé]|auto|hd|sd)$/i;
+    var hostWords = /voe|dood|vidmoly|filemoon|streamtape|sibnet|uqload|luluvdo|sendvid|myvi|ok\.ru|netu|waaw|lecteur|player|server|serveur|mirror|stream|hdvid|upstream|mixdrop|mp4upload|yourupload|vk|wish|vidhide|earnvids/i;
+    var trapWords = /^(pr[eé]c[eé]dent|suivant|prev|next|partager|share|signaler|report|t[eé]l[eé]charger|download|favori|bookmark|comment|accueil|home|liste|bande[- ]?annonce|trailer|vf|vostfr|vo)$/i;
+    var epTrap = /^(ep|ép|episode|épisode|saison|season)?\s*0*\d{1,3}$/i;
+    var placeholderOpt = /^(choisir|select|choose|sélectionner|--)/i;
+
     var selects = document.querySelectorAll('select');
     for (var s = 0; s < selects.length; s++) {
       var sel = selects[s];
+      if (sel.closest && sel.closest('header,footer,nav')) continue;
       var sr = sel.getBoundingClientRect();
-      if (sr.width < 20 || sr.height < 16) continue;
-      for (var p = 0; p < prefs.length; p++) {
-        var kw = prefs[p];
-        for (var o = 0; o < sel.options.length; o++) {
-          var opt = sel.options[o];
-          if (opt.dataset && opt.dataset.vgTried === '1') continue;
-          var ot = (opt.textContent || '').trim();
-          var ov = (opt.value || '').toLowerCase();
-          if ((ot.toLowerCase().indexOf(kw) >= 0 || ov.indexOf(kw) >= 0) && o !== sel.selectedIndex) {
-            if (opt.dataset) opt.dataset.vgTried = '1';
-            sel.selectedIndex = o;
-            sel.dispatchEvent(new Event('change', {bubbles: true}));
-            return ot || kw;
-          }
+      if (sr.width < 24 || sr.height < 16) continue;
+      var csS = getComputedStyle(sel);
+      if (csS.display === 'none' || csS.visibility === 'hidden') continue;
+
+      var opts = [];
+      var langHits = 0, hostHits = 0, epHits = 0;
+      for (var o = 0; o < sel.options.length; o++) {
+        var opt = sel.options[o];
+        var ot = (opt.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!ot || opt.disabled || placeholderOpt.test(ot)) continue;
+        if (langOnly.test(ot)) langHits++;
+        if (hostWords.test(ot) || hostWords.test(opt.value || '')) hostHits++;
+        if (epTrap.test(ot)) epHits++;
+        opts.push({ idx: o, label: ot, selected: o === sel.selectedIndex });
+      }
+      if (opts.length < 1) continue;
+      var selMeta = (sel.id + ' ' + sel.name + ' ' + sel.className).toLowerCase();
+      var isLangSelect = (langHits > 0 && hostHits === 0 && langHits >= opts.length * 0.5 && !/player|server|lecteur/.test(selMeta));
+      var isEpSelect = (epHits >= opts.length * 0.6 && hostHits === 0) || /episode|saison|season/.test(selMeta);
+      if (isLangSelect || isEpSelect) continue;
+      if (opts.length >= 2 || hostHits > 0 || /player|server|lecteur/.test(selMeta)) {
+        sel.setAttribute('data-vg-sel', String(s));
+        for (var k = 0; k < opts.length; k++) {
+          out.push({ id: 'sel_' + s + '_' + opts[k].idx, label: opts[k].label, selected: opts[k].selected });
         }
+        return JSON.stringify(out);
       }
     }
-    var nodes = Array.prototype.slice.call(document.querySelectorAll(
-      'a,button,li,[role="button"],[onclick],[data-src],[data-url],[data-embed],[data-link],.server,.player,[class*="server"],[class*="player"]'
+
+    // Cherche la zone principale du lecteur pour scorer la proximité des boutons
+    var anchorY = window.innerHeight * 0.4;
+    var mediaEls = document.querySelectorAll('iframe, video');
+    for (var m = 0; m < mediaEls.length; m++) {
+      var mr = mediaEls[m].getBoundingClientRect();
+      var msrc = (mediaEls[m].src || '');
+      if (mr.width >= 200 && mr.height >= 120 && msrc.indexOf('challenges.cloudflare.com') < 0) {
+        anchorY = mr.top + mr.height / 2;
+        break;
+      }
+    }
+
+    var rawNodes = Array.prototype.slice.call(document.querySelectorAll(
+      'a,button,li,[role="button"],[onclick],[data-src],[data-url],[data-embed],[data-link],[data-player],[data-server],.server,.player,[class*="server"],[class*="player"],[class*="lecteur"]'
     ));
-    function isValidBtn(el){
-      if (el.dataset && el.dataset.vgTried === '1') return false;
+
+    function validBtn(el){
+      if (el.closest && el.closest('header,footer,nav')) return false;
       if (el.querySelector('iframe,video,select')) return false;
       if (el.tagName !== 'A' && el.tagName !== 'BUTTON' && el.querySelector('a,button')) return false;
       var r = el.getBoundingClientRect();
-      if (r.width < 20 || r.height < 18 || r.width > window.innerWidth * 0.9) return false;
+      if (r.width < 20 || r.height < 18 || r.width > window.innerWidth * 0.85 || r.height > 120) return false;
       var cs = getComputedStyle(el);
-      return cs.display !== 'none' && cs.visibility !== 'hidden' && parseFloat(cs.opacity) > 0.1;
-    }
-    function labelOf(el){
-      var t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
-      var extra = [el.getAttribute('data-player'), el.getAttribute('data-server'), el.getAttribute('data-name'), el.getAttribute('title'), el.id].filter(Boolean).join(' ');
-      return { text: t, full: (t + ' ' + extra).toLowerCase(), hasMeta: extra.length > 0 };
-    }
-    var candidates = nodes.filter(function(el){
-      if (!isValidBtn(el)) return false;
-      var info = labelOf(el);
-      return (info.text.length >= 1 && info.text.length <= 36) || info.hasMeta;
-    });
-    for (var p = 0; p < prefs.length; p++) {
-      var kw = prefs[p];
-      for (var i = 0; i < candidates.length; i++) {
-        var el = candidates[i];
-        if (el.closest && el.closest('header,footer,nav')) continue;
-        var info = labelOf(el);
-        if (info.full.indexOf(kw) >= 0) {
-          if (el.dataset) el.dataset.vgTried = '1';
-          el.scrollIntoView({block:'center', behavior:'instant'});
-          el.click();
-          return info.text || kw;
-        }
-      }
-    }
-  } catch(e){}
-  return '';
-})();
-""".trimIndent()
-        val res = evalJs(wv, js).orEmpty().trim()
-        return res.ifBlank { null }
+      if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) <= 0.1) return false;
+      var txt = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+      var meta = [el.getAttribute('data-player'), el.getAttribute('data-server'), el.getAttribute('data-name'), el.getAttribute('data-src'), el.getAttribute('data-embed'), el.getAttribute('title')].filter(Boolean).join(' ');
+      if (txt.length === 0 && meta.length === 0) return false;
+      if (txt.length > 42 && !meta) return false;
+      if (trapWords.test(txt) && !hostWords.test(meta)) return false;
+      if (/épisode (suivant|précédent)|(next|prev) episode|signaler|télécharger/i.test(txt)) return false;
+      if (epTrap.test(txt) && !hostWords.test(meta) && !/lecteur|player|server/i.test(el.parentElement ? el.parentElement.className : '')) return false;
+      return true;
     }
 
-    /** Cherche le <video> ou le vrai <iframe> lecteur (avec src valide) et renvoie son centre. */
-    suspend fun findPlayerTarget(wv: WebView, muteVideo: Boolean = true): PlayerTarget? {
+    var groups = [];
+    var groupMap = new Map();
+    for (var i = 0; i < rawNodes.length; i++) {
+      var el = rawNodes[i];
+      if (!validBtn(el)) continue;
+      var p = el.parentElement;
+      if (!p) continue;
+      // Si le bouton est un <a> dans un <li> seul, remonte au <ul> / conteneur commun
+      if ((p.tagName === 'LI' || p.children.length === 1) && p.parentElement && p.parentElement.children.length >= 2) {
+        p = p.parentElement;
+      }
+      if (!groupMap.has(p)) {
+        var g = { parent: p, items: [] };
+        groupMap.set(p, g);
+        groups.push(g);
+      }
+      var arr = groupMap.get(p).items;
+      if (arr.indexOf(el) < 0) arr.push(el);
+    }
+
+    var bestGroup = null, bestScore = -999;
+    for (var gIdx = 0; gIdx < groups.length; gIdx++) {
+      var grp = groups[gIdx];
+      var items = grp.items;
+      if (items.length < 2 && !hostWords.test((items[0].innerText || '') + ' ' + (items[0].className || ''))) continue;
+      var pMeta = (grp.parent.id + ' ' + grp.parent.className).toLowerCase();
+      var sc = 0;
+      if (/player|server|lecteur|mirror|embed|source|stream/.test(pMeta)) sc += 50;
+      var gr = grp.parent.getBoundingClientRect();
+      var dist = Math.abs((gr.top + gr.height / 2) - anchorY);
+      if (dist < 380) sc += 25;
+      else if (dist > 900) sc -= 20;
+      if (items.length >= 2 && items.length <= 16) sc += 15;
+
+      var hostCnt = 0, metaCnt = 0;
+      for (var j = 0; j < items.length; j++) {
+        var it = items[j];
+        var lbl = (it.innerText || it.textContent || '').replace(/\s+/g, ' ').trim();
+        var ex = [it.getAttribute('data-player'), it.getAttribute('data-server'), it.getAttribute('data-embed'), it.getAttribute('data-src'), it.className].filter(Boolean).join(' ');
+        if (hostWords.test(lbl + ' ' + ex)) hostCnt++;
+        if (it.hasAttribute('data-src') || it.hasAttribute('data-embed') || it.hasAttribute('data-player') || it.hasAttribute('data-server')) metaCnt++;
+      }
+      sc += hostCnt * 25 + metaCnt * 20;
+      if (sc > bestScore && sc >= 25) {
+        bestScore = sc;
+        bestGroup = items;
+      }
+    }
+
+    if (bestGroup) {
+      for (var b = 0; b < bestGroup.length; b++) {
+        var btn = bestGroup[b];
+        var pid = 'btn_' + b;
+        btn.setAttribute('data-vg-pid', pid);
+        var label = (btn.innerText || btn.textContent || '').replace(/\s+/g, ' ').trim()
+          || btn.getAttribute('data-player') || btn.getAttribute('data-server') || ('Lecteur ' + (b + 1));
+        var cls = (btn.className || '').toLowerCase();
+        var isSel = /\b(active|selected|current|on)\b/.test(cls) || btn.getAttribute('aria-selected') === 'true';
+        out.push({ id: pid, label: label.slice(0, 36), selected: isSel });
+      }
+    }
+    return JSON.stringify(out);
+  } catch(e){}
+  return '[]';
+})();
+""".trimIndent()
+        val raw = evalJs(wv, js) ?: return emptyList()
+        return runCatching {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                PlayerOption(
+                    id = o.getString("id"),
+                    label = o.getString("label"),
+                    isSelected = o.optBoolean("selected", false)
+                )
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    /** Sélectionne précisément un lecteur découvert via son identifiant (`sel_...` ou `btn_...`). */
+    suspend fun selectPlayerById(wv: WebView, id: String): Boolean {
+        val quotedId = JSONObject.quote(id)
+        val js = """
+(function(){
+  try {
+    var pid = $quotedId;
+    if (pid.indexOf('sel_') === 0) {
+      var parts = pid.split('_');
+      var sIdx = parts[1], oIdx = parseInt(parts[2], 10);
+      var sel = document.querySelector('select[data-vg-sel="' + sIdx + '"]') || document.querySelectorAll('select')[parseInt(sIdx, 10)];
+      if (!sel || isNaN(oIdx) || oIdx < 0 || oIdx >= sel.options.length) return '0';
+      if (sel.selectedIndex !== oIdx) {
+        sel.selectedIndex = oIdx;
+        sel.dispatchEvent(new Event('input', {bubbles: true}));
+        sel.dispatchEvent(new Event('change', {bubbles: true}));
+      }
+      return '1';
+    }
+    var btn = document.querySelector('[data-vg-pid="' + pid + '"]');
+    if (!btn) return '0';
+    btn.scrollIntoView({block:'center', behavior:'instant'});
+    btn.click();
+    return '1';
+  } catch(e){}
+  return '0';
+})();
+""".trimIndent()
+        return evalJs(wv, js) == "1"
+    }
+
+    /** Cherche uniquement un <video> direct sur la page principale (hors iframe). */
+    suspend fun findDirectVideoTarget(wv: WebView, muteVideo: Boolean = true): PlayerTarget? =
+        findTargetInternal(wv, muteVideo, directOnly = true)
+
+    /** Cherche le <video> ou le vrai <iframe> lecteur et renvoie sa boîte + centre. */
+    suspend fun findPlayerTarget(wv: WebView, muteVideo: Boolean = true): PlayerTarget? =
+        findTargetInternal(wv, muteVideo, directOnly = false)
+
+    private suspend fun findTargetInternal(wv: WebView, muteVideo: Boolean, directOnly: Boolean): PlayerTarget? {
         val muteFlag = if (muteVideo) "true" else "false"
+        val dirOnly = if (directOnly) "true" else "false"
         val js = """
 (function(){
   try {
     var W = window.innerWidth || 1, H = window.innerHeight || 1;
-    var best = null, bestScore = 0;
+    var best = null, bestScore = 0, isDirect = false;
     var vids = document.querySelectorAll('video');
     for (var i = 0; i < vids.length; i++) {
       var v = vids[i];
       var r = v.getBoundingClientRect();
       if (r.width >= 180 && r.height >= 110 && r.width * r.height > bestScore) {
-        best = v; bestScore = r.width * r.height * 3;
+        best = v; bestScore = r.width * r.height * 3; isDirect = true;
         try { v.muted = $muteFlag; v.play(); } catch(e){}
       }
     }
-    if (!best) {
+    if (!best && !$dirOnly) {
       var frames = document.querySelectorAll('iframe');
       var skip = /recaptcha|hcaptcha|turnstile|cloudflare|googlesyndication|doubleclick|facebook\.com\/plugins|twitter|adsterra|exoclick|tsyndicate|juicyads|adskeeper|disqus/i;
       var good = /embed|\/e\/|voe|dood|vidmoly|sibnet|filemoon|stream|player|video|uqload|luluvdo|sendvid|myvi|ok\.ru|netu|waaw/i;
@@ -204,7 +358,10 @@ object PageAutomator {
     var cx = br.left + br.width / 2;
     var cy = br.top + br.height / 2;
     if (cx < 0 || cy < 0 || cx > W || cy > H) return '';
-    return JSON.stringify({cx: cx, cy: cy, iw: W, ih: H});
+    return JSON.stringify({
+      l: br.left, t: br.top, w: br.width, h: br.height,
+      cx: cx, cy: cy, iw: W, ih: H, dv: isDirect
+    });
   } catch(e){}
   return '';
 })();
@@ -214,19 +371,30 @@ object PageAutomator {
         return runCatching {
             val o = JSONObject(raw)
             PlayerTarget(
+                left = o.getDouble("l").toFloat(),
+                top = o.getDouble("t").toFloat(),
+                width = o.getDouble("w").toFloat().coerceAtLeast(1f),
+                height = o.getDouble("h").toFloat().coerceAtLeast(1f),
                 cx = o.getDouble("cx").toFloat(),
                 cy = o.getDouble("cy").toFloat(),
                 innerW = o.getDouble("iw").toFloat().coerceAtLeast(1f),
-                innerH = o.getDouble("ih").toFloat().coerceAtLeast(1f)
+                innerH = o.getDouble("ih").toFloat().coerceAtLeast(1f),
+                isDirectVideo = o.optBoolean("dv", false)
             )
         }.getOrNull()
     }
 
-    fun tapWebView(wv: WebView, target: PlayerTarget) {
+    fun tapWebView(wv: WebView, target: PlayerTarget, relX: Float = 0.5f, relY: Float = 0.5f) {
+        val pageX = target.left + target.width * relX.coerceIn(0.08f, 0.92f)
+        val pageY = target.top + target.height * relY.coerceIn(0.08f, 0.92f)
+        tapPoint(wv, pageX, pageY, target.innerW, target.innerH)
+    }
+
+    fun tapPoint(wv: WebView, pageX: Float, pageY: Float, innerW: Float, innerH: Float) {
         wv.post {
             if (wv.width <= 0 || wv.height <= 0) return@post
-            val vx = ((target.cx / target.innerW) * wv.width.toFloat()).coerceIn(1f, wv.width - 1f)
-            val vy = ((target.cy / target.innerH) * wv.height.toFloat()).coerceIn(1f, wv.height - 1f)
+            val vx = ((pageX / innerW) * wv.width.toFloat()).coerceIn(1f, wv.width - 1f)
+            val vy = ((pageY / innerH) * wv.height.toFloat()).coerceIn(1f, wv.height - 1f)
             val downTime = SystemClock.uptimeMillis()
             val down = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, vx, vy, 0)
             wv.dispatchTouchEvent(down)
