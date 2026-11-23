@@ -89,7 +89,7 @@ object TransferManager {
         if (sources.isEmpty()) {
             _state.value = TransferState(
                 role = TransferRole.SENDING,
-                status = TransferStatus.READY,
+                status = TransferStatus.IDLE,
                 localIp = net.primaryIp,
                 includeApk = includeApk,
                 message = "Sélectionnez au moins une vidéo"
@@ -115,8 +115,8 @@ object TransferManager {
                     }
                 }
             },
-            onProgressReport = { doneBytes, doneFiles ->
-                scope.launch { applySenderProgress(doneBytes, doneFiles) }
+            onProgressReport = { _, doneFiles ->
+                scope.launch { applySenderConfirm(doneFiles) }
             },
             onRawBytesSent = { idx, delta ->
                 scope.launch { applyRawBytes(idx, delta) }
@@ -258,6 +258,7 @@ object TransferManager {
     private fun stopInternal() {
         netWatchJob?.cancel()
         discoveryJob?.cancel()
+        TransferClient.cancelAll()
         receiveJob?.cancel()
         progressPushJob?.cancel()
         server?.stop()
@@ -304,26 +305,23 @@ object TransferManager {
         }
     }
 
-    private fun applySenderProgress(doneBytes: Long, doneFiles: Int) {
+    /** Confirme côté émetteur les fichiers enregistrés par le client sans faire reculer la barre temps réel. */
+    private fun applySenderConfirm(doneFiles: Int) {
         _state.update { st ->
             if (st.role != TransferRole.SENDING) return@update st
-            val total = st.totalBytes
-            val (spd, eta) = computeSpeed(doneBytes, total)
-            var rem = doneBytes
             val updatedFiles = st.files.mapIndexed { idx, f ->
-                val sz = f.sizeBytes.coerceAtLeast(0L)
-                val isDone = idx < doneFiles || (sz > 0L && rem >= sz && idx < doneFiles)
-                val cur = minOf(sz, rem.coerceAtLeast(0L))
-                rem = (rem - sz).coerceAtLeast(0L)
-                f.copy(transferredBytes = cur, done = isDone || doneFiles >= st.totalFiles)
+                if (idx < doneFiles) f.copy(
+                    transferredBytes = maxOf(f.transferredBytes, f.sizeBytes),
+                    done = true
+                ) else f
             }
             val finished = doneFiles >= st.totalFiles && st.totalFiles > 0
             st.copy(
                 files = updatedFiles,
-                status = if (finished) TransferStatus.DONE else TransferStatus.TRANSFERRING,
-                speedBps = if (finished) 0L else spd,
-                etaSec = if (finished) 0L else eta,
-                message = if (finished) "Envoi terminé (${st.totalFiles}/${st.totalFiles})" else "Envoi vers ${st.peerName}…"
+                status = if (finished) TransferStatus.DONE else st.status,
+                speedBps = if (finished) 0L else st.speedBps,
+                etaSec = if (finished) 0L else st.etaSec,
+                message = if (finished) "Envoi terminé (${st.totalFiles}/${st.totalFiles})" else st.message
             )
         }
     }
@@ -331,6 +329,7 @@ object TransferManager {
     private fun applyRawBytes(index: Int, delta: Long) {
         _state.update { st ->
             if (st.role != TransferRole.SENDING || st.status == TransferStatus.DONE) return@update st
+            val fromBrowser = st.peerName == "Navigateur Web"
             val files = st.files.map { f ->
                 if (f.index == index) {
                     val next = (f.transferredBytes + delta).coerceAtMost(f.sizeBytes.coerceAtLeast(0L))
@@ -339,7 +338,14 @@ object TransferManager {
             }
             val totalDone = files.sumOf { it.transferredBytes }
             val (spd, eta) = computeSpeed(totalDone, st.totalBytes)
-            st.copy(files = files, speedBps = spd, etaSec = eta)
+            val allDoneByBrowser = fromBrowser && files.isNotEmpty() && files.all { it.done }
+            st.copy(
+                files = files,
+                status = if (allDoneByBrowser) TransferStatus.DONE else TransferStatus.TRANSFERRING,
+                speedBps = if (allDoneByBrowser) 0L else spd,
+                etaSec = if (allDoneByBrowser) 0L else eta,
+                message = if (allDoneByBrowser) "Envoi terminé (${st.totalFiles}/${st.totalFiles})" else st.message
+            )
         }
     }
 
