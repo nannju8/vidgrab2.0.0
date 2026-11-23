@@ -10,6 +10,7 @@ import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import com.vidgrab.app.data.LibraryRepository
 import com.vidgrab.app.data.Storage
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -21,6 +22,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.Call
 import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
 import okhttp3.MediaType.Companion.toMediaType
@@ -30,14 +32,15 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.File
-import java.io.FileOutputStream
 import java.io.IOException
+import java.io.OutputStream
 import java.io.RandomAccessFile
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetSocketAddress
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
@@ -61,6 +64,13 @@ object TransferClient {
 
     private val pingClient: OkHttpClient by lazy {
         client.newBuilder().callTimeout(1100, TimeUnit.MILLISECONDS).build()
+    }
+
+    private val activeCalls = ConcurrentHashMap.newKeySet<Call>()
+
+    fun cancelAll() {
+        activeCalls.forEach { runCatching { it.cancel() } }
+        activeCalls.clear()
     }
 
     data class AuthResult(val token: String, val files: List<TransferFileState>)
@@ -211,23 +221,23 @@ object TransferClient {
             put(MediaStore.Video.Media.IS_PENDING, 1)
         }
         val collection = MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-        val uri = resolver.insert(collection, values) ?: throw IOException("MediaStore inaccessible")
+        var uri = resolver.insert(collection, values) ?: throw IOException("MediaStore inaccessible")
         try {
-            var pfd: ParcelFileDescriptor? = null
             val usedParallel = if (file.sizeBytes > 0L) {
                 runCatching {
-                    pfd = resolver.openFileDescriptor(uri, "rw")
-                    val fd = pfd ?: throw IOException("FD null")
-                    FileOutputStream(fd.fileDescriptor).channel.use { ch ->
-                        parallelWrite(url, token, file.sizeBytes, ch, onProgress)
+                    val fd = resolver.openFileDescriptor(uri, "rw") ?: throw IOException("FD null")
+                    ParcelFileDescriptor.AutoCloseOutputStream(fd).use { fos ->
+                        parallelWrite(url, token, file.sizeBytes, fos.channel, onProgress)
                     }
                     true
                 }.getOrElse { err ->
-                    if (err is kotlinx.coroutines.CancellationException) throw err
+                    if (err is CancellationException) throw err
+                    // Repart d'un fichier vierge pour éviter toute trace partielle avant le repli
+                    runCatching { resolver.delete(uri, null, null) }
+                    uri = resolver.insert(collection, values) ?: throw IOException("MediaStore inaccessible")
                     false
                 }
             } else false
-            runCatching { pfd?.close() }
 
             if (!usedParallel) {
                 resolver.openOutputStream(uri, "w")?.use { out ->
@@ -289,21 +299,27 @@ object TransferClient {
                         val end = minOf(start + BLOCK, total) - 1L
                         val req = Request.Builder().url(url).header("X-VG-Token", token)
                             .header("Range", "bytes=$start-$end").build()
-                        client.newCall(req).execute().use { r ->
-                            if (!r.isSuccessful) throw IOException("HTTP ${r.code}")
-                            val ins = BufferedInputStream(r.body?.byteStream() ?: throw IOException("Vide"), BUF)
-                            var pos = start
-                            while (pos <= end) {
-                                ensureActive()
-                                val want = minOf(BUF.toLong(), end - pos + 1L).toInt()
-                                val k = ins.read(buf, 0, want)
-                                if (k < 0) throw IOException("Fin prématurée")
-                                val bb = ByteBuffer.wrap(buf, 0, k)
-                                var w = 0L
-                                while (bb.hasRemaining()) w += channel.write(bb, pos + w).toLong()
-                                pos += k.toLong()
-                                done.addAndGet(k.toLong())
+                        val call = client.newCall(req)
+                        activeCalls.add(call)
+                        try {
+                            call.execute().use { r ->
+                                if (!r.isSuccessful) throw IOException("HTTP ${r.code}")
+                                val ins = BufferedInputStream(r.body?.byteStream() ?: throw IOException("Vide"), BUF)
+                                var pos = start
+                                while (pos <= end) {
+                                    ensureActive()
+                                    val want = minOf(BUF.toLong(), end - pos + 1L).toInt()
+                                    val k = ins.read(buf, 0, want)
+                                    if (k < 0) throw IOException("Fin prématurée")
+                                    val bb = ByteBuffer.wrap(buf, 0, k)
+                                    var w = 0L
+                                    while (bb.hasRemaining()) w += channel.write(bb, pos + w).toLong()
+                                    pos += k.toLong()
+                                    done.addAndGet(k.toLong())
+                                }
                             }
+                        } finally {
+                            activeCalls.remove(call)
                         }
                     }
                 }
@@ -315,29 +331,35 @@ object TransferClient {
     }
 
     private suspend fun singleWrite(
-        url: String, token: String, out: java.io.OutputStream, onProgress: (Long) -> Unit
+        url: String, token: String, out: OutputStream, onProgress: (Long) -> Unit
     ) = withContext(Dispatchers.IO) {
         out.use { os ->
             val req = Request.Builder().url(url).header("X-VG-Token", token).build()
-            client.newCall(req).execute().use { r ->
-                if (!r.isSuccessful) throw IOException("HTTP ${r.code}")
-                val ins = BufferedInputStream(r.body?.byteStream() ?: throw IOException("Vide"), BUF)
-                val buf = ByteArray(BUF)
-                var done = 0L
-                var last = 0L
-                while (true) {
-                    ensureActive()
-                    val k = ins.read(buf)
-                    if (k < 0) break
-                    os.write(buf, 0, k)
-                    done += k.toLong()
-                    val now = System.currentTimeMillis()
-                    if (now - last > 250L) {
-                        onProgress(done)
-                        last = now
+            val call = client.newCall(req)
+            activeCalls.add(call)
+            try {
+                call.execute().use { r ->
+                    if (!r.isSuccessful) throw IOException("HTTP ${r.code}")
+                    val ins = BufferedInputStream(r.body?.byteStream() ?: throw IOException("Vide"), BUF)
+                    val buf = ByteArray(BUF)
+                    var done = 0L
+                    var last = 0L
+                    while (true) {
+                        ensureActive()
+                        val k = ins.read(buf)
+                        if (k < 0) break
+                        os.write(buf, 0, k)
+                        done += k.toLong()
+                        val now = System.currentTimeMillis()
+                        if (now - last > 250L) {
+                            onProgress(done)
+                            last = now
+                        }
                     }
+                    onProgress(done)
                 }
-                onProgress(done)
+            } finally {
+                activeCalls.remove(call)
             }
         }
     }
