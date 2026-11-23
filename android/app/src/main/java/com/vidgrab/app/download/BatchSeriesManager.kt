@@ -32,15 +32,16 @@ import kotlinx.coroutines.launch
 
 /**
  * Orchestrateur du Mode Série :
- * - Choisit d'abord le lecteur déjà actif / 1er lecteur du site (ou le lecteur gagnant mémorisé),
- * - Observe réellement l'intérieur de l'iframe (chargement, Cloudflare, lecteur mort, bouton Play prêt),
- * - Enchaîne tous les lecteurs du 1er jusqu'au dernier en cas d'échec,
- * - N'alerte l'utilisateur (NEEDS_USER) qu'en dernier recours.
+ * À chaque épisode, sans exception :
+ * 1) Teste d'abord le bouton Play / lecteur déjà préchargé sur la page,
+ * 2) Sinon (ou en cas d'échec), teste strictement tous les lecteurs dans l'ordre du site (1er -> 2e -> 3e -> ...),
+ * 3) N'alerte l'utilisateur (NEEDS_USER) qu'après avoir tout essayé.
  */
 object BatchSeriesManager {
 
     private const val CHANNEL_ALERTS = "batch_alerts"
     private const val NOTIF_BATCH_ID = 4343
+    private const val PAGE_LOAD_TIMEOUT_MS = 20_000L
 
     private enum class PlayerAttemptResult { FOUND_STREAM, DEAD, BLOCKED, FAILED }
 
@@ -48,6 +49,7 @@ object BatchSeriesManager {
     private var runnerJob: Job? = null
     private var episodeJob: Job? = null
     private var collectJob: Job? = null
+    private var loadingTimeoutJob: Job? = null
 
     private val _state = MutableStateFlow(BatchState())
     val state: StateFlow<BatchState> = _state
@@ -105,6 +107,7 @@ object BatchSeriesManager {
         val st = _state.value
         if (st.status == BatchStatus.IDLE || st.status == BatchStatus.DONE) return
         episodeToken++
+        loadingTimeoutJob?.cancel()
         episodeJob?.cancel()
         collectJob?.cancel()
         runnerJob?.cancel()
@@ -128,6 +131,7 @@ object BatchSeriesManager {
         val st = _state.value
         if (st.config == null || st.status == BatchStatus.IDLE || st.status == BatchStatus.DONE) return
         episodeToken++
+        loadingTimeoutJob?.cancel()
         episodeJob?.cancel()
         collectJob?.cancel()
         runnerJob?.cancel()
@@ -137,9 +141,11 @@ object BatchSeriesManager {
 
     fun stop() {
         episodeToken++
+        loadingTimeoutJob?.cancel()
         episodeJob?.cancel()
         collectJob?.cancel()
         runnerJob?.cancel()
+        loadingTimeoutJob = null
         episodeJob = null
         collectJob = null
         runnerJob = null
@@ -161,6 +167,7 @@ object BatchSeriesManager {
         if (cfg.tabId != tabId || currentEpisodeHandled) return
         if (st.status != BatchStatus.LOADING_PAGE && st.status != BatchStatus.NEEDS_USER) return
         val tab = findTab(tabId) ?: return
+        loadingTimeoutJob?.cancel()
 
         if (tab.videos.any { isLikelyEpisode(it) }) {
             schedulePickFromTab(tab, cfg, st.currentEp, episodeToken, immediate = false)
@@ -177,17 +184,14 @@ object BatchSeriesManager {
         if (code == 404 || code == 410) {
             consecutiveNotFound++
             episodeToken++
+            loadingTimeoutJob?.cancel()
             episodeJob?.cancel()
             collectJob?.cancel()
             _state.value = st.copy(failedEps = st.failedEps + st.currentEp)
             if (consecutiveNotFound >= 2) finishBatch("Arrêt auto : épisodes introuvables (HTTP $code)")
             else advanceToNext()
-        } else if (code == 403 || code == 503 || code == 429) {
-            episodeJob?.cancel()
-            val msg = "Ép. ${st.currentEp} : vérification Cloudflare (HTTP $code) requise"
-            _state.value = st.copy(status = BatchStatus.NEEDS_USER, message = msg)
-            notifyBatch("Action requise", msg)
         }
+        // Pour 403/503/429 : on laisse onPageFinished + startPageAutomation vérifier et attendre l'auto-résolution Cloudflare
     }
 
     fun onVideoDetected(tabId: Int, video: DetectedVideo) {
@@ -225,9 +229,11 @@ object BatchSeriesManager {
 
     private fun loadEpisode(tab: TabState, cfg: BatchConfig, ep: Int) {
         episodeToken++
+        loadingTimeoutJob?.cancel()
         episodeJob?.cancel()
         collectJob?.cancel()
         currentEpisodeHandled = false
+        val token = episodeToken
         val url = BatchUrlPattern.buildUrl(cfg.urlTemplate, ep, cfg.padWidth)
         _state.value = _state.value.copy(
             status = BatchStatus.LOADING_PAGE,
@@ -236,11 +242,24 @@ object BatchSeriesManager {
             playerTotal = 0,
             message = "Chargement Ép. $ep/${cfg.endEp}…"
         )
-        TabManager.load(tab, url)
+        TabManager.load(tab, url, fromUser = false)
+
+        loadingTimeoutJob = scope.launch {
+            delay(PAGE_LOAD_TIMEOUT_MS)
+            val st = _state.value
+            if (token != episodeToken || currentEpisodeHandled || st.status != BatchStatus.LOADING_PAGE) return@launch
+            TabManager.stop(tab)
+            if (tab.videos.any { isLikelyEpisode(it) }) {
+                schedulePickFromTab(tab, cfg, ep, token, immediate = true)
+            } else {
+                startPageAutomation(tab, cfg, ep, token, quietIfBlocked = false)
+            }
+        }
     }
 
     private fun startPageAutomation(tab: TabState, cfg: BatchConfig, ep: Int, token: Long, quietIfBlocked: Boolean = false) {
         val wv = tab.webView ?: return
+        loadingTimeoutJob?.cancel()
         episodeJob?.cancel()
         episodeJob = scope.launch {
             fun validToken(): Boolean = token == episodeToken && !currentEpisodeHandled && isActive
@@ -277,11 +296,12 @@ object BatchSeriesManager {
 
             _state.value = _state.value.copy(
                 status = BatchStatus.AUTOMATING,
-                message = "Ép. $ep/${cfg.endEp} : repérage des lecteurs…"
+                message = "Ép. $ep/${cfg.endEp} : recherche Play / lecteurs…"
             )
 
-            // 2) Découvre la liste complète des lecteurs du site (attend brièvement si rendu JS asynchrone)
+            // 2) Attend brièvement que le lecteur préchargé ou la liste des lecteurs apparaisse dans le DOM
             var players = emptyList<PageAutomator.PlayerOption>()
+            var preloadedTarget: PageAutomator.PlayerTarget? = null
             for (waitDom in 0 until 6) {
                 if (!validToken()) return@launch
                 if (tab.videos.any { isLikelyEpisode(it) }) {
@@ -289,31 +309,57 @@ object BatchSeriesManager {
                     return@launch
                 }
                 players = PageAutomator.discoverPlayers(wv)
-                if (players.isNotEmpty() || PageAutomator.findPlayerTarget(wv, muteVideo = true) != null) break
+                preloadedTarget = PageAutomator.findPlayerTarget(wv, muteVideo = true, includeMainPlayBtn = true)
+                if (players.isNotEmpty() || preloadedTarget != null) break
                 delay(250L)
             }
 
-            // 3) Aucun sélecteur de lecteur : page mono-lecteur intégrée directement
+            // 3) ÉTAPE 1 : Cliquer d'abord sur Play / tester ce qui est déjà préchargé sur la page
+            var testedPreloaded = false
+            if (preloadedTarget != null) {
+                testedPreloaded = true
+                _state.value = _state.value.copy(
+                    status = BatchStatus.AUTOMATING,
+                    playerIndex = 0,
+                    playerTotal = players.size,
+                    message = "Ép. $ep : test bouton Play / lecteur préchargé…"
+                )
+                val preRes = testActivePlayer(
+                    tab, cfg, ep, token,
+                    playerLabel = "Lecteur préchargé",
+                    num = 0,
+                    totalPlayers = players.size,
+                    allowMainPlayBtn = true
+                )
+                if (preRes == PlayerAttemptResult.FOUND_STREAM || !validToken()) return@launch
+
+                // Si le clic sur Play sur la page a fait apparaître de nouveaux lecteurs
+                if (players.isEmpty()) {
+                    players = PageAutomator.discoverPlayers(wv)
+                }
+            }
+
             if (players.isEmpty()) {
-                _state.value = _state.value.copy(playerIndex = 1, playerTotal = 1)
-                val res = testActivePlayer(tab, cfg, ep, token, "Lecteur principal", 1, 1)
-                if (res == PlayerAttemptResult.FOUND_STREAM || !validToken()) return@launch
                 val msg = "Ép. $ep : impossible de lancer le lecteur, action requise"
                 _state.value = _state.value.copy(status = BatchStatus.NEEDS_USER, message = msg)
                 if (!quietIfBlocked) notifyBatch("Action requise (Ép. $ep)", msg)
                 return@launch
             }
 
-            // 4) Ordre de parcours :
-            //    - Si un lecteur gagnant est mémorisé (épisode précédent ou clic manuel), on le met en tête,
-            //    - Sinon on commence par le 1er lecteur du site (ou celui déjà actif par défaut),
-            //    - Puis on enchaîne strictement jusqu'au tout dernier lecteur.
-            val ordered = buildSequentialOrder(players, tab.winningPlayerLabel.ifBlank { tab.lastClickedPlayer })
-            val totalPlayers = ordered.size
+            // 4) ÉTAPE 2 : Tester strictement tous les lecteurs dans l'ordre du site (1er -> 2e -> 3e -> ...)
+            val totalPlayers = players.size
+            val singleSelectedCount = players.count { it.isSelected }
 
-            for ((idx, opt) in ordered.withIndex()) {
+            for ((idx, opt) in players.withIndex()) {
                 if (!validToken()) return@launch
                 val num = idx + 1
+
+                // Si l'étape 1 a déjà testé le lecteur préchargé ET que ce bouton unique était clairement celui actif,
+                // inutile de retester exactement le même lecteur une deuxième fois.
+                if (testedPreloaded && singleSelectedCount == 1 && opt.isSelected) {
+                    continue
+                }
+
                 _state.value = _state.value.copy(
                     status = BatchStatus.AUTOMATING,
                     playerIndex = num,
@@ -321,25 +367,36 @@ object BatchSeriesManager {
                     message = "Ép. $ep : lecteur $num/$totalPlayers (${opt.label})…"
                 )
 
-                // Si ce n'est pas le lecteur déjà affiché au premier test, on clique/sélectionne ce lecteur
-                val alreadyActive = idx == 0 && opt.isSelected
-                if (!alreadyActive) {
-                    tab.resetIframeTracking()
-                    tab.videos.clear()
-                    tab.sniffer.reset()
-                    PageAutomator.selectPlayerById(wv, opt.id)
-                    delay(450L)
-                    if (!validToken()) return@launch
-                }
+                tab.resetIframeTracking()
+                tab.videos.clear()
+                tab.sniffer.reset()
 
-                val res = testActivePlayer(tab, cfg, ep, token, opt.label, num, totalPlayers)
-                if (res == PlayerAttemptResult.FOUND_STREAM) {
-                    tab.winningPlayerLabel = opt.label
-                    return@launch
+                var clicked = PageAutomator.selectPlayerById(wv, opt.id)
+                if (!clicked) {
+                    // Si le DOM a été rechargé/reconstruit par un clic précédent, on re-découvre les lecteurs
+                    val fresh = PageAutomator.discoverPlayers(wv)
+                    val match = fresh.firstOrNull { it.label.equals(opt.label, ignoreCase = true) }
+                        ?: fresh.getOrNull(idx)
+                    if (match != null) {
+                        clicked = PageAutomator.selectPlayerById(wv, match.id)
+                    }
                 }
+                if (!clicked) continue
+
+                delay(450L)
+                if (!validToken()) return@launch
+
+                val res = testActivePlayer(
+                    tab, cfg, ep, token,
+                    playerLabel = opt.label,
+                    num = num,
+                    totalPlayers = totalPlayers,
+                    allowMainPlayBtn = true
+                )
+                if (res == PlayerAttemptResult.FOUND_STREAM || !validToken()) return@launch
             }
 
-            // 5) Tous les lecteurs du site ont échoué : on alerte seulement maintenant
+            // 5) Tous les lecteurs ont échoué : on alerte l'utilisateur
             if (validToken()) {
                 val msg = "Ép. $ep : les $totalPlayers lecteurs ont échoué, action requise"
                 _state.value = _state.value.copy(status = BatchStatus.NEEDS_USER, message = msg)
@@ -349,12 +406,10 @@ object BatchSeriesManager {
     }
 
     /**
-     * Teste le lecteur actuellement chargé en observant son iframe en temps réel :
-     * - Attend la fin du chargement (LOADING),
-     * - Attend la résolution auto de Cloudflare dans l'iframe (max ~9 s),
-     * - Abandonne tout de suite si DEAD (vidéo supprimée / 404),
-     * - Ne clique Play qu'une fois PLAY_READY (coordonnées exactes dans l'iframe),
-     * - Sort à la milliseconde où VideoSniffer détecte le flux.
+     * Teste le lecteur actuellement affiché :
+     * - Si un bouton Play est sur la page principale (sans iframe encore créée), clique dessus immédiatement,
+     * - Observe en direct l'iframe via IframeObserver (chargement, Cloudflare, lecteur mort, Play prêt),
+     * - Sort dès que VideoSniffer détecte la vidéo.
      */
     private suspend fun testActivePlayer(
         tab: TabState,
@@ -363,12 +418,14 @@ object BatchSeriesManager {
         token: Long,
         playerLabel: String,
         num: Int,
-        totalPlayers: Int
+        totalPlayers: Int,
+        allowMainPlayBtn: Boolean
     ): PlayerAttemptResult {
         val wv = tab.webView ?: return PlayerAttemptResult.FAILED
         val currentJob = currentCoroutineContext()[Job]
         fun valid(): Boolean = token == episodeToken && !currentEpisodeHandled && (currentJob?.isActive != false)
 
+        val labelPrefix = if (num > 0 && totalPlayers > 0) "Ép. $ep · $playerLabel ($num/$totalPlayers)" else "Ép. $ep · $playerLabel"
         var tapsDone = 0
         var lastTapAt = 0L
         var cfSeenSince = 0L
@@ -383,12 +440,10 @@ object BatchSeriesManager {
             lastLoopAt = now
 
             if (tab.videos.any { isLikelyEpisode(it) }) {
-                tab.winningPlayerLabel = playerLabel
                 schedulePickFromTab(tab, cfg, ep, token, immediate = false)
                 return PlayerAttemptResult.FOUND_STREAM
             }
 
-            // Si le clic sur le bouton lecteur a provoqué un rechargement complet de la page, on attend la fin du chargement
             if (tab.loading) {
                 loadingPausedMs += dt
                 if (loadingPausedMs > 12_000L) return PlayerAttemptResult.FAILED
@@ -401,20 +456,22 @@ object BatchSeriesManager {
                 return if (cfSeenSince > 0L) PlayerAttemptResult.BLOCKED else PlayerAttemptResult.FAILED
             }
 
-            // 1) Vérifie s'il y a un <video> direct sur la page principale
+            // 1) <video> direct sur la page principale
             val directVideo = PageAutomator.findDirectVideoTarget(wv, muteVideo = true)
             if (directVideo != null) {
                 if (now - lastTapAt >= 2_800L && tapsDone < 3) {
                     tapsDone++
                     lastTapAt = now
-                    _state.value = _state.value.copy(message = "Ép. $ep · $playerLabel ($num/$totalPlayers) : lecture…")
+                    _state.value = _state.value.copy(message = "$labelPrefix : lecture…")
                     PageAutomator.tapWebView(wv, directVideo)
+                } else if (tapsDone >= 3 && now - lastTapAt >= 3_800L) {
+                    return PlayerAttemptResult.FAILED
                 }
                 delay(250L)
                 continue
             }
 
-            // 2) Vérifie les erreurs HTTP de l'iframe (404/410 = mort immédiat, 403/503 = Cloudflare)
+            // 2) Erreur HTTP 404/410 sur le document HTML d'une iframe
             val subErrAt = tab.lastSubframeHttpErrorAt
             val sysNow = System.currentTimeMillis()
             if (subErrAt > 0L && (sysNow - subErrAt) < 4_000L) {
@@ -437,10 +494,10 @@ object BatchSeriesManager {
                 deadSeenSince = 0L
             }
 
-            // 4) Cloudflare dans l'iframe : on patiente sans cliquer (jusqu'à 9 s pour auto-résolution)
+            // 4) Cloudflare dans l'iframe : on patiente jusqu'à 9 s sans cliquer
             if (snap.phase == FramePhase.CLOUDFLARE || netCfActive) {
                 if (cfSeenSince == 0L) cfSeenSince = now
-                _state.value = _state.value.copy(message = "Ép. $ep · $playerLabel ($num/$totalPlayers) : Cloudflare…")
+                _state.value = _state.value.copy(message = "$labelPrefix : Cloudflare…")
                 if (now - cfSeenSince >= 9_000L) return PlayerAttemptResult.BLOCKED
                 delay(300L)
                 continue
@@ -448,30 +505,29 @@ object BatchSeriesManager {
                 cfSeenSince = 0L
             }
 
-            // 5) Chargement en cours dans l'iframe : on attend qu'il se termine
+            // 5) Chargement en cours dans l'iframe
             if (snap.phase == FramePhase.LOADING) {
-                _state.value = _state.value.copy(message = "Ép. $ep · $playerLabel ($num/$totalPlayers) : chargement…")
+                _state.value = _state.value.copy(message = "$labelPrefix : chargement…")
                 delay(250L)
                 continue
             }
 
-            // 6) Lecteur prêt (Play visible via IframeObserver) OU repli prudent si WebView ne supporte pas IframeObserver
+            // 6) Bouton Play sur la page principale (avant même qu'une iframe existe) ou iframe prête
+            val outerTarget = PageAutomator.findPlayerTarget(wv, muteVideo = true, includeMainPlayBtn = allowMainPlayBtn)
+            val mainPlayReady = outerTarget != null && outerTarget.isMainPlayButton
             val readyByObserver = snap.phase == FramePhase.PLAY_READY
             val fallbackQuiet = (!IframeObserver.isSupported || snap.phase == FramePhase.UNKNOWN) &&
                 elapsed >= 2_400L &&
                 (tab.lastSubframeAt == 0L || (sysNow - tab.lastSubframeAt) >= 1_200L)
 
-            if (readyByObserver || fallbackQuiet) {
-                val outerTarget = PageAutomator.findPlayerTarget(wv, muteVideo = true)
+            if (mainPlayReady || readyByObserver || fallbackQuiet) {
                 if (outerTarget != null) {
                     if (now - lastTapAt >= 2_800L && tapsDone < 3) {
                         tapsDone++
                         lastTapAt = now
-                        _state.value = _state.value.copy(
-                            message = "Ép. $ep · $playerLabel ($num/$totalPlayers) : Play ($tapsDone/3)…"
-                        )
-                        val rx = if (readyByObserver) snap.relX else 0.5f
-                        val ry = if (readyByObserver) snap.relY else 0.5f
+                        _state.value = _state.value.copy(message = "$labelPrefix : Play ($tapsDone/3)…")
+                        val rx = if (readyByObserver && !mainPlayReady) snap.relX else 0.5f
+                        val ry = if (readyByObserver && !mainPlayReady) snap.relY else 0.5f
                         PageAutomator.tapWebView(wv, outerTarget, rx, ry)
                     } else if (tapsDone >= 3 && now - lastTapAt >= 3_800L) {
                         return PlayerAttemptResult.FAILED
@@ -484,32 +540,6 @@ object BatchSeriesManager {
             delay(250L)
         }
         return PlayerAttemptResult.FAILED
-    }
-
-    private fun buildSequentialOrder(
-        players: List<PageAutomator.PlayerOption>,
-        winningLabel: String
-    ): List<PageAutomator.PlayerOption> {
-        if (players.size <= 1) return players
-        val preferred = winningLabel.trim().lowercase()
-        val winner = if (preferred.isNotBlank()) {
-            players.firstOrNull {
-                it.label.lowercase() == preferred ||
-                    it.label.lowercase().contains(preferred) ||
-                    preferred.contains(it.label.lowercase())
-            }
-        } else null
-
-        if (winner != null) {
-            return listOf(winner) + players.filter { it.id != winner.id }
-        }
-        // Aucun gagnant mémorisé : respecte l'ordre du site (déjà sélectionné en 1er, puis 1er -> dernier)
-        val selected = players.firstOrNull { it.isSelected }
-        return if (selected != null && selected != players.first()) {
-            listOf(selected) + players.filter { it.id != selected.id }
-        } else {
-            players
-        }
     }
 
     private fun schedulePickFromTab(
@@ -538,6 +568,7 @@ object BatchSeriesManager {
 
             currentEpisodeHandled = true
             episodeToken++
+            loadingTimeoutJob?.cancel()
             episodeJob?.cancel()
             consecutiveNotFound = 0
 
@@ -567,6 +598,7 @@ object BatchSeriesManager {
 
     private fun finishBatch(msg: String) {
         episodeToken++
+        loadingTimeoutJob?.cancel()
         episodeJob?.cancel()
         collectJob?.cancel()
         runnerJob?.cancel()
