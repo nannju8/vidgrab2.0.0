@@ -11,6 +11,7 @@ import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.vidgrab.app.MainActivity
@@ -25,6 +26,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 
@@ -57,7 +59,9 @@ class DownloadService : Service() {
             ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
         )
         scope.launch {
-            combine(DownloadCenter.tasks, TransferManager.state) { list, tx -> list to tx }.collect { (list, tx) ->
+            var lastNotifAt = 0L
+            var lastSignature = ""
+            combine(DownloadCenter.tasks, TransferManager.state) { list, tx -> list to tx }.collectLatest { (list, tx) ->
                 val active = list.filter {
                     it.status == DlStatus.RUNNING || it.status == DlStatus.QUEUED || it.status == DlStatus.MERGING
                 }
@@ -67,28 +71,32 @@ class DownloadService : Service() {
                     releaseLocks()
                     ServiceCompat.stopForeground(this@DownloadService, ServiceCompat.STOP_FOREGROUND_REMOVE)
                     stopSelf()
-                    return@collect
+                    return@collectLatest
                 }
                 holdLocks()
 
-                if (active.isNotEmpty()) {
+                val signature = if (active.isNotEmpty()) "dl:${active.size}" else "tx:${tx.role}:${tx.completedFiles}"
+                val now = SystemClock.elapsedRealtime()
+                val waitMs = if (signature != lastSignature) 0L else (900L - (now - lastNotifAt)).coerceAtLeast(0L)
+                if (waitMs > 0L) delay(waitMs)
+
+                val (notifText, pct) = if (active.isNotEmpty()) {
                     val speed: Long = active.sumOf { it.speedBps }
                     val total: Long = active.sumOf { it.total }
                     val done: Long = active.sumOf { it.downloaded }
-                    val pct: Int = if (total > 0L) ((done * 100L) / total).toInt().coerceIn(0, 100) else 0
+                    val p: Int = if (total > 0L) ((done * 100L) / total).toInt().coerceIn(0, 100) else 0
                     val title = if (active.size <= 1) "Téléchargement en cours" else "${active.size} téléchargements en cours"
-                    nm.notify(NOTIF_ID, buildNotification("$title • $pct % • ${Format.speed(speed)}", pct, false, true))
+                    "$title • $p % • ${Format.speed(speed)}" to p
                 } else {
                     val total = tx.totalBytes
                     val done = tx.transferredBytes
-                    val pct: Int = if (total > 0L) ((done * 100L) / total).toInt().coerceIn(0, 100) else 0
+                    val p: Int = if (total > 0L) ((done * 100L) / total).toInt().coerceIn(0, 100) else 0
                     val verb = if (tx.role == TransferRole.SENDING) "Envoi Wi-Fi" else "Réception Wi-Fi"
-                    nm.notify(
-                        NOTIF_ID,
-                        buildNotification("$verb (${tx.completedFiles}/${tx.totalFiles}) • $pct % • ${Format.speed(tx.speedBps)}", pct, false, false)
-                    )
+                    "$verb (${tx.completedFiles}/${tx.totalFiles}) • $p % • ${Format.speed(tx.speedBps)}" to p
                 }
-                delay(1000L)
+                nm.notify(NOTIF_ID, buildNotification(notifText, pct, false, active.isNotEmpty()))
+                lastNotifAt = SystemClock.elapsedRealtime()
+                lastSignature = signature
             }
         }
     }
