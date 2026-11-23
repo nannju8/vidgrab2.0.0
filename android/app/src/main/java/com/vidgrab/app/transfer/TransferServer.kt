@@ -194,75 +194,68 @@ class TransferServer(
     }
 
     private fun streamFile(ch: SocketChannel, index: Int, src: TransferSource, rangeHeader: String?) {
-        var pfd: ParcelFileDescriptor? = null
-        var fis: FileInputStream? = null
-        try {
-            val fc: FileChannel = if (src.file != null) {
-                FileInputStream(src.file).also { fis = it }.channel
-            } else if (src.uri != null) {
-                val fd = ctx.contentResolver.openFileDescriptor(src.uri, "r") ?: throw IOException("URI illisible")
-                pfd = fd
-                FileInputStream(fd.fileDescriptor).also { fis = it }.channel
-            } else throw IOException("Source vide")
+        val stream = if (src.file != null) {
+            FileInputStream(src.file)
+        } else if (src.uri != null) {
+            val fd = ctx.contentResolver.openFileDescriptor(src.uri, "r") ?: throw IOException("URI illisible")
+            ParcelFileDescriptor.AutoCloseInputStream(fd)
+        } else throw IOException("Source vide")
 
-            fc.use { channel ->
-                val total = channel.size().takeIf { it > 0L } ?: src.sizeBytes
-                var start = 0L
-                var end = total - 1L
-                var isPartial = false
+        stream.use { fis ->
+            val channel: FileChannel = fis.channel
+            val total = channel.size().takeIf { it > 0L } ?: src.sizeBytes
+            var start = 0L
+            var end = total - 1L
+            var isPartial = false
 
-                if (!rangeHeader.isNullOrBlank() && rangeHeader.startsWith("bytes=")) {
-                    val spec = rangeHeader.removePrefix("bytes=").trim()
-                    val sPart = spec.substringBefore('-').trim()
-                    val ePart = spec.substringAfter('-', "").trim()
-                    start = sPart.toLongOrNull()?.coerceIn(0L, (total - 1L).coerceAtLeast(0L)) ?: 0L
-                    end = ePart.toLongOrNull()?.coerceIn(start, (total - 1L).coerceAtLeast(0L)) ?: (total - 1L)
-                    isPartial = true
-                }
-                val contentLen = (end - start + 1L).coerceAtLeast(0L)
-                val mime = if (src.isApk) "application/vnd.android.package-archive" else "application/octet-stream"
-                val safeFile = "${src.name.replace("\"", "")}.${src.ext}"
-
-                val hdr = buildString {
-                    append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
-                    append("Content-Type: $mime\r\nAccept-Ranges: bytes\r\nContent-Length: $contentLen\r\n")
-                    if (isPartial) append("Content-Range: bytes $start-$end/$total\r\n")
-                    append("Content-Disposition: attachment; filename=\"$safeFile\"\r\nConnection: close\r\n\r\n")
-                }
-                writeFully(ch, ByteBuffer.wrap(hdr.toByteArray(Charsets.UTF_8)))
-
-                var pos = start
-                var remaining = contentLen
-                var useFallback = false
-                var directBuf: ByteBuffer? = null
-
-                while (remaining > 0L) {
-                    val want = minOf(CHUNK, remaining)
-                    if (!useFallback) {
-                        val transferred = try { channel.transferTo(pos, want, ch) } catch (_: IOException) { -1L }
-                        if (transferred > 0L) {
-                            pos += transferred
-                            remaining -= transferred
-                            onRawBytesSent(index, transferred)
-                            continue
-                        }
-                        useFallback = true
-                    }
-                    val buf = directBuf ?: ByteBuffer.allocateDirect(DIRECT_BUF).also { directBuf = it }
-                    buf.clear()
-                    if (remaining < buf.capacity()) buf.limit(remaining.toInt())
-                    val read = channel.read(buf, pos)
-                    if (read <= 0) break
-                    buf.flip()
-                    writeFully(ch, buf)
-                    pos += read.toLong()
-                    remaining -= read.toLong()
-                    onRawBytesSent(index, read.toLong())
-                }
+            if (!rangeHeader.isNullOrBlank() && rangeHeader.startsWith("bytes=")) {
+                val spec = rangeHeader.removePrefix("bytes=").trim()
+                val sPart = spec.substringBefore('-').trim()
+                val ePart = spec.substringAfter('-', "").trim()
+                start = sPart.toLongOrNull()?.coerceIn(0L, (total - 1L).coerceAtLeast(0L)) ?: 0L
+                end = ePart.toLongOrNull()?.coerceIn(start, (total - 1L).coerceAtLeast(0L)) ?: (total - 1L)
+                isPartial = true
             }
-        } finally {
-            runCatching { fis?.close() }
-            runCatching { pfd?.close() }
+            val contentLen = (end - start + 1L).coerceAtLeast(0L)
+            val mime = if (src.isApk) "application/vnd.android.package-archive" else "application/octet-stream"
+            val safeFile = "${src.name.replace(Regex("[\"\\r\\n]"), "")}.${src.ext.replace(Regex("[\"\\r\\n]"), "")}"
+
+            val hdr = buildString {
+                append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
+                append("Content-Type: $mime\r\nAccept-Ranges: bytes\r\nContent-Length: $contentLen\r\n")
+                if (isPartial) append("Content-Range: bytes $start-$end/$total\r\n")
+                append("Content-Disposition: attachment; filename=\"$safeFile\"\r\nConnection: close\r\n\r\n")
+            }
+            writeFully(ch, ByteBuffer.wrap(hdr.toByteArray(Charsets.UTF_8)))
+
+            var pos = start
+            var remaining = contentLen
+            var useFallback = false
+            var directBuf: ByteBuffer? = null
+
+            while (remaining > 0L) {
+                val want = minOf(CHUNK, remaining)
+                if (!useFallback) {
+                    val transferred = try { channel.transferTo(pos, want, ch) } catch (_: IOException) { -1L }
+                    if (transferred > 0L) {
+                        pos += transferred
+                        remaining -= transferred
+                        onRawBytesSent(index, transferred)
+                        continue
+                    }
+                    useFallback = true
+                }
+                val buf = directBuf ?: ByteBuffer.allocateDirect(DIRECT_BUF).also { directBuf = it }
+                buf.clear()
+                if (remaining < buf.capacity()) buf.limit(remaining.toInt())
+                val read = channel.read(buf, pos)
+                if (read <= 0) break
+                buf.flip()
+                writeFully(ch, buf)
+                pos += read.toLong()
+                remaining -= read.toLong()
+                onRawBytesSent(index, read.toLong())
+            }
         }
     }
 
@@ -284,7 +277,8 @@ class TransferServer(
 
         val rows = sources.mapIndexed { idx, s ->
             val mb = String.format("%.1f Mo", s.sizeBytes / (1024.0 * 1024.0))
-            "<a class='item' href='/file/$idx?token=$token'><b>${s.name}.${s.ext}</b><span>$mb</span></a>"
+            val safeLabel = escapeHtml("${s.name}.${s.ext}")
+            "<a class='item' href='/file/$idx?token=$token'><b>$safeLabel</b><span>$mb</span></a>"
         }.joinToString("")
         val html = "<!doctype html><html><meta name='viewport' content='width=device-width,initial-scale=1'>" +
             "<style>body{background:#0B0D14;color:#E8EAF6;font-family:sans-serif;padding:20px}h2{color:#06B6D4}.item{display:flex;justify-content:space-between;background:#171B2B;padding:14px;margin:10px 0;border-radius:14px;color:#fff;text-decoration:none;border:1px solid #2b3252}span{color:#06B6D4}</style>" +
@@ -292,8 +286,21 @@ class TransferServer(
         writeText(ch, 200, "OK", "text/html; charset=utf-8", html)
     }
 
+    private fun escapeHtml(s: String): String = buildString(s.length) {
+        for (ch in s) {
+            when (ch) {
+                '&' -> append("&amp;")
+                '<' -> append("&lt;")
+                '>' -> append("&gt;")
+                '"' -> append("&quot;")
+                '\'' -> append("&#39;")
+                else -> append(ch)
+            }
+        }
+    }
+
     private fun htmlPinForm(err: String? = null): String {
-        val errHtml = if (err != null) "<p style='color:#F43F5E'>$err</p>" else ""
+        val errHtml = if (err != null) "<p style='color:#F43F5E'>${escapeHtml(err)}</p>" else ""
         return "<!doctype html><html><meta name='viewport' content='width=device-width,initial-scale=1'>" +
             "<style>body{background:#0B0D14;color:#E8EAF6;font-family:sans-serif;padding:30px;text-align:center}input,button{padding:14px;border-radius:12px;border:none;font-size:18px;margin:8px}button{background:#6366F1;color:#fff;font-weight:bold}</style>" +
             "<h2>VidGrab Transfert</h2>$errHtml<form method='get'><input name='pin' type='number' placeholder='Code 4 chiffres' required><br><button type='submit'>Accéder</button></form></html>"
