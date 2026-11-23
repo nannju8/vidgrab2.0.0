@@ -45,7 +45,6 @@ class TabState(val id: Int, val isBatchTab: Boolean = false) {
     @Volatile var lastTypedAt: Long = 0L
     @Volatile var lastLinkClickAt: Long = 0L
     @Volatile var lastClickedPlayer: String = ""
-    @Volatile var winningPlayerLabel: String = ""
     @Volatile var lastSubframeAt: Long = 0L
     @Volatile var lastSubframeChallengeAt: Long = 0L
     @Volatile var lastSubframeHttpError: Int = 0
@@ -118,6 +117,12 @@ object TabManager {
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
     private const val BRIDGE = "VidGrab"
 
+    private val NON_HTML_EXT = listOf(
+        ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+        ".woff", ".woff2", ".ttf", ".ts", ".m4s", ".m3u8", ".mp4",
+        ".json", ".vtt", ".srt", ".xml", ".txt"
+    )
+
     private lateinit var appContext: Context
     val context: Context get() = appContext
 
@@ -161,8 +166,6 @@ object TabManager {
     fun openBackgroundTab(from: TabState): TabState {
         val t = TabState(nextId++, isBatchTab = true).apply {
             desktop = from.desktop
-            lastClickedPlayer = from.lastClickedPlayer
-            winningPlayerLabel = from.winningPlayerLabel.ifBlank { from.lastClickedPlayer }
         }
         tabs.add(t)
         return t
@@ -203,10 +206,11 @@ object TabManager {
         return "https://$t"
     }
 
-    fun load(tab: TabState, input: String) {
+    fun load(tab: TabState, input: String, fromUser: Boolean = true) {
         if (input.isBlank()) return
         val url = normalize(input)
-        tab.lastTypedAt = System.currentTimeMillis()
+        tab.lastTypedAt = if (fromUser) System.currentTimeMillis() else 0L
+        if (!fromUser) tab.lastLinkClickAt = 0L
         tab.resetIframeTracking()
         tab.url = url
         tab.currentUrl = url
@@ -225,7 +229,6 @@ object TabManager {
         tab.title = ""
         tab.loading = false
         tab.progress = 0f
-        tab.winningPlayerLabel = ""
         tab.resetIframeTracking()
         tab.videos.clear()
         tab.sniffer.reset()
@@ -400,11 +403,8 @@ object TabManager {
             } else if (!AdBlocker.isAdHost(request.url.host)) {
                 val path = request.url.path.orEmpty().lowercase()
                 val accept = request.requestHeaders["Accept"].orEmpty().lowercase()
-                val looksLikeDoc = accept.contains("text/html") ||
-                    (!path.endsWith(".js") && !path.endsWith(".css") && !path.endsWith(".png") &&
-                        !path.endsWith(".jpg") && !path.endsWith(".svg") && !path.endsWith(".woff2") &&
-                        !path.endsWith(".ts") && !path.endsWith(".m4s"))
-                if (looksLikeDoc && code in listOf(403, 404, 410, 429, 503)) {
+                val looksLikeHtmlDoc = accept.contains("text/html") && NON_HTML_EXT.none { path.endsWith(it) }
+                if (looksLikeHtmlDoc && code in listOf(403, 404, 410, 429, 503)) {
                     tab.lastSubframeHttpError = code
                     tab.lastSubframeHttpErrorAt = System.currentTimeMillis()
                 }
