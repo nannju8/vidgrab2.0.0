@@ -45,7 +45,12 @@ class TabState(val id: Int, val isBatchTab: Boolean = false) {
     @Volatile var lastTypedAt: Long = 0L
     @Volatile var lastLinkClickAt: Long = 0L
     @Volatile var lastClickedPlayer: String = ""
+    @Volatile var winningPlayerLabel: String = ""
     @Volatile var lastSubframeAt: Long = 0L
+    @Volatile var lastSubframeChallengeAt: Long = 0L
+    @Volatile var lastSubframeHttpError: Int = 0
+    @Volatile var lastSubframeHttpErrorAt: Long = 0L
+    @Volatile var iframeSnapshot: IframeSnapshot = IframeSnapshot()
 
     var url by mutableStateOf("")
     var title by mutableStateOf("")
@@ -75,6 +80,14 @@ class TabState(val id: Int, val isBatchTab: Boolean = false) {
     }
 
     val isHome: Boolean get() = url.isBlank()
+
+    fun resetIframeTracking() {
+        lastSubframeAt = 0L
+        lastSubframeChallengeAt = 0L
+        lastSubframeHttpError = 0
+        lastSubframeHttpErrorAt = 0L
+        iframeSnapshot = IframeSnapshot()
+    }
 }
 
 /** Pont JS → natif. @Keep obligatoire pour R8. */
@@ -149,6 +162,7 @@ object TabManager {
         val t = TabState(nextId++, isBatchTab = true).apply {
             desktop = from.desktop
             lastClickedPlayer = from.lastClickedPlayer
+            winningPlayerLabel = from.winningPlayerLabel.ifBlank { from.lastClickedPlayer }
         }
         tabs.add(t)
         return t
@@ -193,7 +207,7 @@ object TabManager {
         if (input.isBlank()) return
         val url = normalize(input)
         tab.lastTypedAt = System.currentTimeMillis()
-        tab.lastSubframeAt = 0L
+        tab.resetIframeTracking()
         tab.url = url
         tab.currentUrl = url
         tab.loading = true
@@ -211,6 +225,8 @@ object TabManager {
         tab.title = ""
         tab.loading = false
         tab.progress = 0f
+        tab.winningPlayerLabel = ""
+        tab.resetIframeTracking()
         tab.videos.clear()
         tab.sniffer.reset()
     }
@@ -288,6 +304,7 @@ object TabManager {
 
         CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
         wv.addJavascriptInterface(JsBridge(tab), BRIDGE)
+        IframeObserver.attach(wv, tab)
         wv.webViewClient = buildClient(tab)
         wv.webChromeClient = buildChrome(tab)
         wv.setDownloadListener { url, _, _, mime, _ ->
@@ -303,13 +320,20 @@ object TabManager {
         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
             val uri = request.url
             val host = uri.host
+            val url = uri.toString()
             if (!request.isForMainFrame) {
                 if (AdBlocker.isAdHost(host)) {
                     return WebResourceResponse("text/plain", "utf-8", 200, "OK", emptyMap(), ByteArrayInputStream(ByteArray(0)))
                 }
-                tab.lastSubframeAt = System.currentTimeMillis()
+                val now = System.currentTimeMillis()
+                tab.lastSubframeAt = now
+                if (url.contains("challenges.cloudflare.com", true) ||
+                    url.contains("turnstile", true) ||
+                    url.contains("/cdn-cgi/challenge-platform", true)
+                ) {
+                    tab.lastSubframeChallengeAt = now
+                }
             }
-            val url = uri.toString()
             val headers = HashMap<String, String>(request.requestHeaders)
             val cookie: String? = runCatching { CookieManager.getInstance().getCookie(url) }.getOrNull()
             if (!cookie.isNullOrBlank()) headers["Cookie"] = cookie
@@ -344,7 +368,7 @@ object TabManager {
             tab.loading = true
             tab.progress = 0.05f
             tab.scriptInjected = false
-            tab.lastSubframeAt = 0L
+            tab.resetIframeTracking()
             tab.videos.clear()
             tab.sniffer.reset()
             tab.canGoBack = view.canGoBack()
@@ -370,8 +394,20 @@ object TabManager {
         }
 
         override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, errorResponse: WebResourceResponse) {
+            val code = errorResponse.statusCode
             if (request.isForMainFrame) {
-                BatchSeriesManager.onHttpError(tab.id, errorResponse.statusCode)
+                BatchSeriesManager.onHttpError(tab.id, code)
+            } else if (!AdBlocker.isAdHost(request.url.host)) {
+                val path = request.url.path.orEmpty().lowercase()
+                val accept = request.requestHeaders["Accept"].orEmpty().lowercase()
+                val looksLikeDoc = accept.contains("text/html") ||
+                    (!path.endsWith(".js") && !path.endsWith(".css") && !path.endsWith(".png") &&
+                        !path.endsWith(".jpg") && !path.endsWith(".svg") && !path.endsWith(".woff2") &&
+                        !path.endsWith(".ts") && !path.endsWith(".m4s"))
+                if (looksLikeDoc && code in listOf(403, 404, 410, 429, 503)) {
+                    tab.lastSubframeHttpError = code
+                    tab.lastSubframeHttpErrorAt = System.currentTimeMillis()
+                }
             }
         }
 
