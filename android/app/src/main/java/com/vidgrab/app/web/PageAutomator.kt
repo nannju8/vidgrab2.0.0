@@ -10,9 +10,9 @@ import kotlin.coroutines.resume
 
 /**
  * Automatisation WebView :
- * - Découverte universelle des lecteurs (<select> hors langue + groupes de boutons autour du lecteur)
+ * - Découverte universelle des lecteurs (comparaison entre <select> et groupes de boutons)
  * - Détection Cloudflare sur la page principale
- * - Coordonnées précises du <video> ou <iframe> pour un tap ciblé (relX, relY)
+ * - Coordonnées précises du <video>, <iframe> ou bouton Play sur la page pour un tap ciblé (relX, relY)
  */
 object PageAutomator {
 
@@ -31,7 +31,8 @@ object PageAutomator {
         val cy: Float,
         val innerW: Float,
         val innerH: Float,
-        val isDirectVideo: Boolean
+        val isDirectVideo: Boolean,
+        val isMainPlayButton: Boolean = false
     )
 
     val PLAYER_TRACKER_JS: String = """
@@ -115,56 +116,24 @@ object PageAutomator {
     }
 
     /**
-     * Découvre tous les lecteurs disponibles sur la page dans l'ordre naturel du site (1er -> dernier) :
-     * 1) Menus <select> de lecteurs (en ignorant les menus purement langue VF/VOSTFR ou épisodes)
-     * 2) Le meilleur groupe de boutons/onglets de serveurs autour du lecteur vidéo.
+     * Découvre tous les lecteurs disponibles dans l'ordre naturel du site (1er -> dernier)
+     * en comparant le meilleur <select> et le meilleur groupe de boutons.
      */
     suspend fun discoverPlayers(wv: WebView): List<PlayerOption> {
         val js = """
 (function(){
   try {
-    var out = [];
-    var langOnly = /^(vf|vostfr|vo|vf\s*\d*|vostfr\s*\d*|french|english|eng|sub|dub|raw|all|tous|langue|language|qualit[eé]|auto|hd|sd)$/i;
+    var langOnly = /^(vf|vostfr|vo|french|english|eng|sub|dub|raw|all|tous|langue|language|qualit[eé]|auto|hd|sd|fhd|uhd)$/i;
+    var sortTrap = /^(plus r[eé]cents?|plus anciens?|pertinence|meilleurs?|date|vues|populaire|popular|newest|oldest|top|best|a[- ]z|z[- ]a)$/i;
     var hostWords = /voe|dood|vidmoly|filemoon|streamtape|sibnet|uqload|luluvdo|sendvid|myvi|ok\.ru|netu|waaw|lecteur|player|server|serveur|mirror|stream|hdvid|upstream|mixdrop|mp4upload|yourupload|vk|wish|vidhide|earnvids/i;
     var trapWords = /^(pr[eé]c[eé]dent|suivant|prev|next|partager|share|signaler|report|t[eé]l[eé]charger|download|favori|bookmark|comment|accueil|home|liste|bande[- ]?annonce|trailer|vf|vostfr|vo)$/i;
     var epTrap = /^(ep|ép|episode|épisode|saison|season)?\s*0*\d{1,3}$/i;
     var placeholderOpt = /^(choisir|select|choose|sélectionner|--)/i;
 
-    var selects = document.querySelectorAll('select');
-    for (var s = 0; s < selects.length; s++) {
-      var sel = selects[s];
-      if (sel.closest && sel.closest('header,footer,nav')) continue;
-      var sr = sel.getBoundingClientRect();
-      if (sr.width < 24 || sr.height < 16) continue;
-      var csS = getComputedStyle(sel);
-      if (csS.display === 'none' || csS.visibility === 'hidden') continue;
-
-      var opts = [];
-      var langHits = 0, hostHits = 0, epHits = 0;
-      for (var o = 0; o < sel.options.length; o++) {
-        var opt = sel.options[o];
-        var ot = (opt.textContent || '').replace(/\s+/g, ' ').trim();
-        if (!ot || opt.disabled || placeholderOpt.test(ot)) continue;
-        if (langOnly.test(ot)) langHits++;
-        if (hostWords.test(ot) || hostWords.test(opt.value || '')) hostHits++;
-        if (epTrap.test(ot)) epHits++;
-        opts.push({ idx: o, label: ot, selected: o === sel.selectedIndex });
-      }
-      if (opts.length < 1) continue;
-      var selMeta = (sel.id + ' ' + sel.name + ' ' + sel.className).toLowerCase();
-      var isLangSelect = (langHits > 0 && hostHits === 0 && langHits >= opts.length * 0.5 && !/player|server|lecteur/.test(selMeta));
-      var isEpSelect = (epHits >= opts.length * 0.6 && hostHits === 0) || /episode|saison|season/.test(selMeta);
-      if (isLangSelect || isEpSelect) continue;
-      if (opts.length >= 2 || hostHits > 0 || /player|server|lecteur/.test(selMeta)) {
-        sel.setAttribute('data-vg-sel', String(s));
-        for (var k = 0; k < opts.length; k++) {
-          out.push({ id: 'sel_' + s + '_' + opts[k].idx, label: opts[k].label, selected: opts[k].selected });
-        }
-        return JSON.stringify(out);
-      }
+    function cleanLabelForLang(txt){
+      return txt.replace(/\([^)]*\)/g, '').replace(/\b(1080p|720p|480p|360p|4k|hd|sd|fhd)\b/gi, '').replace(/[-–|]+/g, ' ').replace(/\s+/g, ' ').trim();
     }
 
-    // Cherche la zone principale du lecteur pour scorer la proximité des boutons
     var anchorY = window.innerHeight * 0.4;
     var mediaEls = document.querySelectorAll('iframe, video');
     for (var m = 0; m < mediaEls.length; m++) {
@@ -176,6 +145,53 @@ object PageAutomator {
       }
     }
 
+    // 1) Évalue tous les <select> sans retour précoce
+    var bestSelectItems = null, bestSelectIdx = -1, bestSelectScore = -999;
+    var selects = document.querySelectorAll('select');
+    for (var s = 0; s < selects.length; s++) {
+      var sel = selects[s];
+      if (sel.closest && sel.closest('header,footer,nav')) continue;
+      var sr = sel.getBoundingClientRect();
+      if (sr.width < 24 || sr.height < 16) continue;
+      var csS = getComputedStyle(sel);
+      if (csS.display === 'none' || csS.visibility === 'hidden') continue;
+
+      var opts = [];
+      var langHits = 0, hostHits = 0, epHits = 0, sortHits = 0;
+      for (var o = 0; o < sel.options.length; o++) {
+        var opt = sel.options[o];
+        var ot = (opt.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!ot || opt.disabled || placeholderOpt.test(ot)) continue;
+        var stripped = cleanLabelForLang(ot);
+        if (langOnly.test(ot) || (stripped && langOnly.test(stripped))) langHits++;
+        if (sortTrap.test(ot)) sortHits++;
+        if (hostWords.test(ot) || hostWords.test(opt.value || '')) hostHits++;
+        if (epTrap.test(ot)) epHits++;
+        opts.push({ idx: o, label: ot, selected: o === sel.selectedIndex });
+      }
+      if (opts.length < 1) continue;
+      var selMeta = (sel.id + ' ' + sel.name + ' ' + sel.className).toLowerCase();
+      var hasPlayerMeta = /player|server|lecteur|mirror|source/.test(selMeta);
+      var isLangSelect = (langHits > 0 && hostHits === 0 && langHits >= opts.length * 0.5 && !hasPlayerMeta);
+      var isEpSelect = (epHits >= opts.length * 0.6 && hostHits === 0) || /episode|saison|season/.test(selMeta);
+      var isSortSelect = (sortHits >= opts.length * 0.5 && hostHits === 0) || /sort|order|comment|filter|tri/.test(selMeta);
+      if (isLangSelect || isEpSelect || isSortSelect) continue;
+
+      var sc = 0;
+      if (hasPlayerMeta) sc += 50;
+      sc += hostHits * 25;
+      var sDist = Math.abs((sr.top + sr.height / 2) - anchorY);
+      if (sDist < 380) sc += 25;
+      else if (sDist > 900) sc -= 20;
+      if (opts.length >= 2 && opts.length <= 16) sc += 15;
+      if ((opts.length >= 2 || hostHits > 0 || hasPlayerMeta) && sc >= 25 && sc > bestSelectScore) {
+        bestSelectScore = sc;
+        bestSelectItems = opts;
+        bestSelectIdx = s;
+      }
+    }
+
+    // 2) Évalue les groupes de boutons/onglets
     var rawNodes = Array.prototype.slice.call(document.querySelectorAll(
       'a,button,li,[role="button"],[onclick],[data-src],[data-url],[data-embed],[data-link],[data-player],[data-server],.server,.player,[class*="server"],[class*="player"],[class*="lecteur"]'
     ));
@@ -205,9 +221,14 @@ object PageAutomator {
       if (!validBtn(el)) continue;
       var p = el.parentElement;
       if (!p) continue;
-      // Si le bouton est un <a> dans un <li> seul, remonte au <ul> / conteneur commun
-      if ((p.tagName === 'LI' || p.children.length === 1) && p.parentElement && p.parentElement.children.length >= 2) {
-        p = p.parentElement;
+      // Remonte jusqu'à 3 niveaux si les boutons sont emboîtés dans des wrappers intermédiaires
+      for (var up = 0; up < 3; up++) {
+        if (!p.parentElement || p.parentElement === document.body || p.parentElement === document.documentElement) break;
+        if (p.tagName === 'LI' || p.children.length === 1) {
+          p = p.parentElement;
+        } else {
+          break;
+        }
       }
       if (!groupMap.has(p)) {
         var g = { parent: p, items: [] };
@@ -218,19 +239,19 @@ object PageAutomator {
       if (arr.indexOf(el) < 0) arr.push(el);
     }
 
-    var bestGroup = null, bestScore = -999;
+    var bestGroup = null, bestGroupScore = -999;
     for (var gIdx = 0; gIdx < groups.length; gIdx++) {
       var grp = groups[gIdx];
       var items = grp.items;
       if (items.length < 2 && !hostWords.test((items[0].innerText || '') + ' ' + (items[0].className || ''))) continue;
       var pMeta = (grp.parent.id + ' ' + grp.parent.className).toLowerCase();
-      var sc = 0;
-      if (/player|server|lecteur|mirror|embed|source|stream/.test(pMeta)) sc += 50;
+      var scG = 0;
+      if (/player|server|lecteur|mirror|embed|source|stream/.test(pMeta)) scG += 50;
       var gr = grp.parent.getBoundingClientRect();
       var dist = Math.abs((gr.top + gr.height / 2) - anchorY);
-      if (dist < 380) sc += 25;
-      else if (dist > 900) sc -= 20;
-      if (items.length >= 2 && items.length <= 16) sc += 15;
+      if (dist < 380) scG += 25;
+      else if (dist > 900) scG -= 20;
+      if (items.length >= 2 && items.length <= 16) scG += 15;
 
       var hostCnt = 0, metaCnt = 0;
       for (var j = 0; j < items.length; j++) {
@@ -240,14 +261,24 @@ object PageAutomator {
         if (hostWords.test(lbl + ' ' + ex)) hostCnt++;
         if (it.hasAttribute('data-src') || it.hasAttribute('data-embed') || it.hasAttribute('data-player') || it.hasAttribute('data-server')) metaCnt++;
       }
-      sc += hostCnt * 25 + metaCnt * 20;
-      if (sc > bestScore && sc >= 25) {
-        bestScore = sc;
+      scG += hostCnt * 25 + metaCnt * 20;
+      if (scG > bestGroupScore && scG >= 25) {
+        bestGroupScore = scG;
         bestGroup = items;
       }
     }
 
-    if (bestGroup) {
+    var out = [];
+    if (bestSelectItems && (!bestGroup || bestSelectScore > bestGroupScore)) {
+      selects[bestSelectIdx].setAttribute('data-vg-sel', String(bestSelectIdx));
+      for (var k = 0; k < bestSelectItems.length; k++) {
+        out.push({
+          id: 'sel_' + bestSelectIdx + '_' + bestSelectItems[k].idx,
+          label: bestSelectItems[k].label,
+          selected: bestSelectItems[k].selected
+        });
+      }
+    } else if (bestGroup) {
       for (var b = 0; b < bestGroup.length; b++) {
         var btn = bestGroup[b];
         var pid = 'btn_' + b;
@@ -255,7 +286,7 @@ object PageAutomator {
         var label = (btn.innerText || btn.textContent || '').replace(/\s+/g, ' ').trim()
           || btn.getAttribute('data-player') || btn.getAttribute('data-server') || ('Lecteur ' + (b + 1));
         var cls = (btn.className || '').toLowerCase();
-        var isSel = /\b(active|selected|current|on)\b/.test(cls) || btn.getAttribute('aria-selected') === 'true';
+        var isSel = /\b(active|selected|current|on|is-active)\b/.test(cls) || btn.getAttribute('aria-selected') === 'true';
         out.push({ id: pid, label: label.slice(0, 36), selected: isSel });
       }
     }
@@ -311,20 +342,30 @@ object PageAutomator {
 
     /** Cherche uniquement un <video> direct sur la page principale (hors iframe). */
     suspend fun findDirectVideoTarget(wv: WebView, muteVideo: Boolean = true): PlayerTarget? =
-        findTargetInternal(wv, muteVideo, directOnly = true)
+        findTargetInternal(wv, muteVideo, directOnly = true, includeMainPlayBtn = false)
 
-    /** Cherche le <video> ou le vrai <iframe> lecteur et renvoie sa boîte + centre. */
-    suspend fun findPlayerTarget(wv: WebView, muteVideo: Boolean = true): PlayerTarget? =
-        findTargetInternal(wv, muteVideo, directOnly = false)
+    /** Cherche le <video>, le vrai <iframe> lecteur ou un bouton Play sur la page principale. */
+    suspend fun findPlayerTarget(
+        wv: WebView,
+        muteVideo: Boolean = true,
+        includeMainPlayBtn: Boolean = false
+    ): PlayerTarget? =
+        findTargetInternal(wv, muteVideo, directOnly = false, includeMainPlayBtn = includeMainPlayBtn)
 
-    private suspend fun findTargetInternal(wv: WebView, muteVideo: Boolean, directOnly: Boolean): PlayerTarget? {
+    private suspend fun findTargetInternal(
+        wv: WebView,
+        muteVideo: Boolean,
+        directOnly: Boolean,
+        includeMainPlayBtn: Boolean
+    ): PlayerTarget? {
         val muteFlag = if (muteVideo) "true" else "false"
         val dirOnly = if (directOnly) "true" else "false"
+        val playFallback = if (includeMainPlayBtn && !directOnly) "true" else "false"
         val js = """
 (function(){
   try {
     var W = window.innerWidth || 1, H = window.innerHeight || 1;
-    var best = null, bestScore = 0, isDirect = false;
+    var best = null, bestScore = 0, isDirect = false, isMainBtn = false;
     var vids = document.querySelectorAll('video');
     for (var i = 0; i < vids.length; i++) {
       var v = vids[i];
@@ -349,6 +390,27 @@ object PageAutomator {
         }
       }
     }
+    if (!best && $playFallback) {
+      var sels = [
+        '.vjs-big-play-button', '.plyr__control--overlaid', '.jw-icon-display',
+        '[aria-label*="play" i]', '[title*="play" i]',
+        '[class*="play-btn" i]', '[class*="playbtn" i]', '[class*="btn-play" i]', '[id*="play" i]'
+      ];
+      for (var s = 0; s < sels.length && !best; s++) {
+        var list = document.querySelectorAll(sels[s]);
+        for (var p = 0; p < list.length; p++) {
+          var el = list[p];
+          if (el.hasAttribute('data-vg-pid')) continue;
+          if (el.closest && el.closest('header,footer,nav')) continue;
+          var cs = getComputedStyle(el);
+          if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) < 0.1) continue;
+          var pr = el.getBoundingClientRect();
+          if (pr.width >= 32 && pr.height >= 32 && pr.width <= W * 0.85 && pr.height <= H * 0.85) {
+            best = el; isMainBtn = true; break;
+          }
+        }
+      }
+    }
     if (!best) return '';
     var br = best.getBoundingClientRect();
     if (br.top < 0 || br.bottom > H) {
@@ -360,7 +422,7 @@ object PageAutomator {
     if (cx < 0 || cy < 0 || cx > W || cy > H) return '';
     return JSON.stringify({
       l: br.left, t: br.top, w: br.width, h: br.height,
-      cx: cx, cy: cy, iw: W, ih: H, dv: isDirect
+      cx: cx, cy: cy, iw: W, ih: H, dv: isDirect, mb: isMainBtn
     });
   } catch(e){}
   return '';
@@ -379,7 +441,8 @@ object PageAutomator {
                 cy = o.getDouble("cy").toFloat(),
                 innerW = o.getDouble("iw").toFloat().coerceAtLeast(1f),
                 innerH = o.getDouble("ih").toFloat().coerceAtLeast(1f),
-                isDirectVideo = o.optBoolean("dv", false)
+                isDirectVideo = o.optBoolean("dv", false),
+                isMainPlayButton = o.optBoolean("mb", false)
             )
         }.getOrNull()
     }
