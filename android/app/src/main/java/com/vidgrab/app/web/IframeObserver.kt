@@ -59,9 +59,14 @@ object IframeObserver {
         val now = System.currentTimeMillis()
         val prev = tab.iframeSnapshot
 
-        // Évite qu'un petit widget secondaire n'écrase la grande iframe vidéo déjà détectée
-        val stale = (now - prev.updatedAt) > 1500L
+        val stale = (now - prev.updatedAt) > 1800L
         val sameOrigin = prev.origin == origin || prev.origin.isEmpty()
+
+        // Tant qu'un challenge Cloudflare actif est récent, un petit encadré secondaire ne l'efface pas
+        if (!stale && prev.phase == FramePhase.CLOUDFLARE && phase != FramePhase.CLOUDFLARE && !sameOrigin && !hasVideo && !hasPlay) {
+            return
+        }
+
         val strongerSignal = (hasVideo || hasPlay) && !prev.hasVideoElement && !prev.hasPlayButton
         val largeEnough = area >= (prev.area * 0.65f).toInt()
         if (!stale && !sameOrigin && !strongerSignal && !largeEnough && phase != FramePhase.CLOUDFLARE) {
@@ -88,13 +93,16 @@ object IframeObserver {
   window.__vgObs = true;
   var skipHref = /recaptcha|hcaptcha|googlesyndication|doubleclick|facebook\.com\/plugins|twitter|disqus|chatango|adsterra|exoclick|tsyndicate|juicyads|adskeeper|about:blank/i;
   var lastKey = '';
+  var lastSentAt = 0;
 
   function post(payload){
     try {
       if (!window.$CHANNEL || typeof window.$CHANNEL.postMessage !== 'function') return;
       var k = payload.phase + '|' + payload.hasPlay + '|' + payload.hasVideo + '|' + Math.round(payload.rx * 20) + '|' + Math.round(payload.ry * 20);
-      if (k === lastKey && payload.phase !== 'play_ready') return;
+      var now = Date.now();
+      if (k === lastKey && payload.phase !== 'play_ready' && (now - lastSentAt) < 700) return;
       lastKey = k;
+      lastSentAt = now;
       window.$CHANNEL.postMessage(JSON.stringify(payload));
     } catch(e){}
   }
@@ -127,7 +135,7 @@ object IframeObserver {
           var txt = (el.innerText || el.getAttribute('aria-label') || el.className || '').toLowerCase();
           var hasSvg = !!el.querySelector('svg,i,path,polygon');
           if (!hasSvg && txt.indexOf('play') < 0 && txt.indexOf('lire') < 0 && txt.indexOf('lecture') < 0) continue;
-          if (r.top > H * 0.82 && r.width < 48) continue; // ignore les mini-icônes de la barre du bas
+          if (r.top > H * 0.82 && r.width < 48) continue;
         }
         return {
           rx: (r.left + r.width / 2) / W,
