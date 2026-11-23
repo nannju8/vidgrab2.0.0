@@ -72,11 +72,6 @@ fun BatchSetupDialog(
     var zeroPad by remember { mutableStateOf(detectedPad > 1) }
     var fastMode by remember { mutableStateOf(true) }
     var quality by remember { mutableStateOf(initialQuality) }
-    var playersText by remember {
-        val base = listOfNotNull(tab.lastClickedPlayer.takeIf { it.isNotBlank() }, "voe", "vidmoly", "doodstream", "filemoon", "sibnet")
-            .distinctBy { it.lowercase() }
-        mutableStateOf(base.joinToString(", "))
-    }
 
     val startNum = startText.toIntOrNull() ?: 1
     val endNum = endText.toIntOrNull() ?: startNum
@@ -204,13 +199,11 @@ fun BatchSetupDialog(
                 }
             }
 
-            Spacer(Modifier.height(8.dp))
-            OutlinedTextField(
-                value = playersText,
-                onValueChange = { playersText = it },
-                label = { Text("Ordre des lecteurs préférés") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Ordre de test des lecteurs : bouton Play / lecteur préchargé d'abord, puis 1er, 2e, 3e… dans l'ordre du site.",
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
             if (valid) {
@@ -244,7 +237,7 @@ fun BatchSetupDialog(
                                 endEp = endNum,
                                 padWidth = padWidth,
                                 targetQuality = quality,
-                                preferredPlayers = playersText.split(',').map { it.trim() }.filter { it.isNotBlank() },
+                                preferredPlayers = emptyList(),
                                 fastMode = fastMode
                             )
                             onStart(cfg)
