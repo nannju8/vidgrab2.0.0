@@ -110,13 +110,13 @@ object LibraryRepository {
     fun rename(ctx: Context, item: LibraryItem, newName: String): Boolean = runCatching {
         val clean = Storage.safeName(newName)
         if (item.isPrivate && item.file != null) {
-            val target = File(item.file.parentFile, "$clean.${item.file.extension}")
+            val ext = item.file.extension.ifBlank { "mp4" }
+            val target = File(item.file.parentFile, "$clean.$ext")
+            if (target == item.file) return true
+            if (target.exists()) return false
             item.file.renameTo(target)
         } else {
-            var ext = "mp4"
-            ctx.contentResolver.query(item.uri, arrayOf(MediaStore.Video.Media.DISPLAY_NAME), null, null, null)?.use { c ->
-                if (c.moveToFirst()) ext = c.getString(0).substringAfterLast('.', "mp4")
-            }
+            val ext = publicExtension(ctx, item.uri)
             val v = ContentValues().apply {
                 put(MediaStore.Video.Media.DISPLAY_NAME, "$clean.$ext")
             }
@@ -124,9 +124,10 @@ object LibraryRepository {
         }
     }.getOrDefault(false)
 
-    /** Copie vers le stockage interne (.nomedia) puis supprime l'original du MediaStore. */
+    /** Copie vers le stockage interne (.nomedia) avec extension exacte et nom unique, puis supprime du MediaStore. */
     fun moveToPrivate(ctx: Context, item: LibraryItem): Boolean = runCatching {
-        val target = File(privateDir(ctx), Storage.safeName(item.title) + ".mp4")
+        val ext = publicExtension(ctx, item.uri)
+        val target = uniquePrivateFile(privateDir(ctx), Storage.safeName(item.title), ext)
         ctx.contentResolver.openInputStream(item.uri)?.use { input ->
             target.outputStream().use { out -> input.copyTo(out, 128 * 1024) }
         } ?: return false
@@ -146,6 +147,37 @@ object LibraryRepository {
             true
         } else false
     }.getOrDefault(false)
+
+    private fun publicExtension(ctx: Context, uri: Uri): String {
+        var ext = ""
+        ctx.contentResolver.query(uri, arrayOf(MediaStore.Video.Media.DISPLAY_NAME), null, null, null)?.use { c ->
+            if (c.moveToFirst()) {
+                val name = c.getString(0).orEmpty()
+                if (name.contains('.')) ext = name.substringAfterLast('.')
+            }
+        }
+        if (ext.isBlank()) {
+            val mime = ctx.contentResolver.getType(uri).orEmpty().lowercase()
+            ext = when {
+                mime.contains("matroska") -> "mkv"
+                mime.contains("webm") -> "webm"
+                mime.contains("mp2t") -> "ts"
+                mime.contains("quicktime") -> "mov"
+                else -> "mp4"
+            }
+        }
+        return ext.lowercase().replace(Regex("[^a-z0-9]"), "").ifBlank { "mp4" }
+    }
+
+    private fun uniquePrivateFile(dir: File, base: String, ext: String): File {
+        var f = File(dir, "$base.$ext")
+        var n = 1
+        while (f.exists()) {
+            f = File(dir, "${base}_$n.$ext")
+            n++
+        }
+        return f
+    }
 
     fun share(ctx: Context, item: LibraryItem) {
         if (item.isPrivate) return // les fichiers privés ne sont jamais exposés
