@@ -71,5 +71,7 @@ data class BatchState(
     val totalEps: Int = 0,
     val message: String = "",
     val completedCount: Int = 0,
-    val failedEps: List<Int> = emptyList()
+    val failedEps: List<Int> = emptyList(),
+    val playerIndex: Int = 0,
+    val playerTotal: Int = 0
 )
