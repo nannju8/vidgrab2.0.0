@@ -16,22 +16,27 @@ object HlsParser {
 
     data class MediaPlaylist(val segments: List<Segment>, val mapUri: String?, val totalDuration: Double)
 
-    fun fetchText(url: String, headers: Map<String, String>): String? {
+    fun fetchText(url: String, headers: Map<String, String>, taskId: String? = null): String? {
         val call = Http.client.newCall(Http.request(url, headers))
-        call.execute().use { r ->
-            if (!r.isSuccessful) return null
-            val ins = r.body?.byteStream() ?: return null
-            val out = ByteArrayOutputStream()
-            val buf = ByteArray(16 * 1024)
-            var total = 0
-            while (true) {
-                val n = ins.read(buf)
-                if (n < 0) break
-                out.write(buf, 0, n)
-                total += n
-                if (total > 2_000_000) break
+        if (taskId != null) Http.register(taskId, call)
+        try {
+            call.execute().use { r ->
+                if (!r.isSuccessful) return null
+                val ins = r.body?.byteStream() ?: return null
+                val out = ByteArrayOutputStream()
+                val buf = ByteArray(16 * 1024)
+                var total = 0
+                while (true) {
+                    val n = ins.read(buf)
+                    if (n < 0) break
+                    out.write(buf, 0, n)
+                    total += n
+                    if (total > 2_000_000) break
+                }
+                return out.toString("UTF-8")
             }
-            return out.toString("UTF-8")
+        } finally {
+            if (taskId != null) Http.unregister(taskId, call)
         }
     }
 
