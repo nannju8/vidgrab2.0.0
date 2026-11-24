@@ -33,7 +33,7 @@ sealed class UpdateState {
 object AppUpdater {
     // Remplace par ton pseudo GitHub et le nom exact de ton dépôt
     private const val GITHUB_OWNER = "nannju8"
-    private const val GITHUB_REPO = "vidgrab"
+    private const val GITHUB_REPO = "vidgrab2.0.0"
 
     private val apiUrl: String
         get() = "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/releases/latest"
