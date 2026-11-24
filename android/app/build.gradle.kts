@@ -14,12 +14,19 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "1.0.0"
+
+        resourceConfigurations += listOf("fr", "en")
+        ndk {
+            // Supprime les binaires x86/x86_64 (émulateurs) tout en gardant la compatibilité 64-bit & 32-bit
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            signingConfig = signingConfigs.getByName("debug")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
         debug {
@@ -42,7 +49,14 @@ android {
     }
 
     packaging {
-        resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        resources.excludes += setOf(
+            "/META-INF/{AL2.0,LGPL2.1}",
+            "/META-INF/*.kotlin_module",
+            "/META-INF/*.version",
+            "/META-INF/proguard/*",
+            "/kotlin/**",
+            "/DebugProbesKt.bin"
+        )
     }
 }
 
