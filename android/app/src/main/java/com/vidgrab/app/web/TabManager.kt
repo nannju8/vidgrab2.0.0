@@ -178,6 +178,7 @@ object TabManager {
 
     fun closeTab(tab: TabState) {
         BatchSeriesManager.stopIfTab(tab.id)
+        tab.preview = null
         tab.webView?.let { wv ->
             runCatching {
                 wv.removeJavascriptInterface(BRIDGE)
@@ -229,6 +230,7 @@ object TabManager {
         tab.title = ""
         tab.loading = false
         tab.progress = 0f
+        tab.preview = null
         tab.resetIframeTracking()
         tab.videos.clear()
         tab.sniffer.reset()
@@ -266,7 +268,11 @@ object TabManager {
         if (wv.width <= 0 || wv.height <= 0 || tab.isHome) return
         runCatching {
             val scale = 0.4f
-            val bmp = Bitmap.createBitmap((wv.width * scale).toInt(), (wv.height * scale).toInt(), Bitmap.Config.ARGB_8888)
+            val bmp = Bitmap.createBitmap(
+                (wv.width * scale).toInt().coerceAtLeast(1),
+                (wv.height * scale).toInt().coerceAtLeast(1),
+                Bitmap.Config.RGB_565
+            )
             val c = Canvas(bmp)
             c.scale(scale, scale)
             wv.draw(c)
