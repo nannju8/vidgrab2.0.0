@@ -29,6 +29,7 @@ import androidx.compose.material.icons.rounded.FullscreenExit
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.LockOpen
 import androidx.compose.material.icons.rounded.Pause
+import androidx.compose.material.icons.rounded.PictureInPictureAlt
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Replay10
 import androidx.compose.material3.Icon
@@ -71,9 +72,16 @@ import kotlinx.coroutines.delay
 
 private data class Ripple(val right: Boolean, val token: Long)
 
-/** Lecteur immersif : contrôles translucides, double-tap ±10 s avec onde circulaire, barre tactile, verrouillage. */
+/** Lecteur immersif : contrôles translucides, double-tap ±10 s, verrouillage et mode PiP. */
 @Composable
-fun PlayerScreen(player: ExoPlayer, title: String, onBack: () -> Unit, onToggleOrientation: () -> Unit) {
+fun PlayerScreen(
+    player: ExoPlayer,
+    title: String,
+    inPip: Boolean = false,
+    onBack: () -> Unit,
+    onToggleOrientation: () -> Unit,
+    onEnterPip: () -> Unit = {}
+) {
     val haptic = LocalHapticFeedback.current
     val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
     var controls by remember { mutableStateOf(true) }
@@ -133,31 +141,31 @@ fun PlayerScreen(player: ExoPlayer, title: String, onBack: () -> Unit, onToggleO
             modifier = Modifier.fillMaxSize()
         )
 
-        // Couche de gestes : tap = afficher/masquer, double-tap gauche/droite = ∓10 s
-        Box(
-            Modifier.fillMaxSize().pointerInput(locked) {
-                detectTapGestures(
-                    onTap = { controls = !controls },
-                    onDoubleTap = { offset ->
-                        if (!locked) {
-                            val right = offset.x > size.width / 2f
-                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                            seekBy(if (right) 10_000L else -10_000L)
-                            ripple = Ripple(right, System.nanoTime())
+        if (!inPip) {
+            Box(
+                Modifier.fillMaxSize().pointerInput(locked) {
+                    detectTapGestures(
+                        onTap = { controls = !controls },
+                        onDoubleTap = { offset ->
+                            if (!locked) {
+                                val right = offset.x > size.width / 2f
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                seekBy(if (right) 10_000L else -10_000L)
+                                ripple = Ripple(right, System.nanoTime())
+                            }
                         }
-                    }
-                )
-            }
-        )
+                    )
+                }
+            )
 
-        ripple?.let { r -> SeekRipple(r) }
+            ripple?.let { r -> SeekRipple(r) }
+        }
 
-        // Verrouillage : seule l'icône de cadenas reste disponible
-        AnimatedVisibility(visible = controls && locked, enter = fadeIn(), exit = fadeOut(), modifier = Modifier.align(Alignment.CenterStart)) {
+        AnimatedVisibility(visible = !inPip && controls && locked, enter = fadeIn(), exit = fadeOut(), modifier = Modifier.align(Alignment.CenterStart)) {
             RoundButton(Icons.Rounded.Lock, 56.dp, VG.alert) { locked = false }
         }
 
-        AnimatedVisibility(visible = controls && !locked, enter = fadeIn(), exit = fadeOut()) {
+        AnimatedVisibility(visible = !inPip && controls && !locked, enter = fadeIn(), exit = fadeOut()) {
             Box(Modifier.fillMaxSize()) {
                 Box(Modifier.fillMaxWidth().fillMaxHeight(0.28f).background(Brush.verticalGradient(listOf(Color.Black.copy(alpha = 0.7f), Color.Transparent))))
                 Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().fillMaxHeight(0.38f).background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.8f)))))
@@ -192,6 +200,8 @@ fun PlayerScreen(player: ExoPlayer, title: String, onBack: () -> Unit, onToggleO
                         val shown: Long = if (seeking) (seekFraction * duration.toFloat()).toLong() else position
                         Text("${Format.duration(shown)} / ${Format.duration(duration)}", color = Color.White, fontSize = 12.sp)
                         Spacer(Modifier.weight(1f))
+                        RoundButton(Icons.Rounded.PictureInPictureAlt, 40.dp, null, onEnterPip)
+                        Spacer(Modifier.width(10.dp))
                         RoundButton(Icons.Rounded.LockOpen, 40.dp, null) { locked = true; controls = true }
                         Spacer(Modifier.width(10.dp))
                         RoundButton(if (landscape) Icons.Rounded.FullscreenExit else Icons.Rounded.Fullscreen, 40.dp, null, onToggleOrientation)
