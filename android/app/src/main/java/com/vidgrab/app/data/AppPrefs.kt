@@ -48,7 +48,7 @@ object AppPrefs {
         themeMode.value = mode
     }
 
-    // ---- Favoris --------------------------------------------------------------------------
+    // ---- Favoris & Sites enregistrés ------------------------------------------------------
     private fun readBookmarks(): List<Bookmark> = runCatching {
         val arr = JSONArray(sp.getString("bookmarks", "[]"))
         (0 until arr.length()).map {
@@ -63,6 +63,11 @@ object AppPrefs {
         sp.edit().putString("bookmarks", arr.toString()).apply()
     }
 
+    private fun normalizeSiteUrl(raw: String): String {
+        val u = raw.trim()
+        return if (u.startsWith("http://") || u.startsWith("https://")) u else "https://$u"
+    }
+
     fun isBookmarked(url: String): Boolean = bookmarks.value.any { it.url == url }
 
     fun toggleBookmark(title: String, url: String): Boolean {
@@ -71,6 +76,50 @@ object AppPrefs {
         else bookmarks.value + Bookmark(title.ifBlank { hostOf(url) }, url)
         writeBookmarks()
         return !exists
+    }
+
+    fun addBookmark(title: String, rawUrl: String): Boolean {
+        val cleanUrl = normalizeSiteUrl(rawUrl)
+        if (cleanUrl.length <= 8) return false
+        val cleanTitle = title.trim().ifBlank { hostOf(cleanUrl) }
+        if (bookmarks.value.any { it.url.equals(cleanUrl, ignoreCase = true) }) return false
+        bookmarks.value = bookmarks.value + Bookmark(cleanTitle, cleanUrl)
+        writeBookmarks()
+        return true
+    }
+
+    fun updateBookmark(oldUrl: String, newTitle: String, rawNewUrl: String): Boolean {
+        val cleanUrl = normalizeSiteUrl(rawNewUrl)
+        if (cleanUrl.length <= 8) return false
+        val cleanTitle = newTitle.trim().ifBlank { hostOf(cleanUrl) }
+        bookmarks.value = bookmarks.value.map {
+            if (it.url == oldUrl) Bookmark(cleanTitle, cleanUrl) else it
+        }
+        writeBookmarks()
+        return true
+    }
+
+    /** Met à jour les liens portant le même nom ou ajoute les nouveaux sites depuis GitHub. */
+    fun mergeSyncedBookmarks(remote: List<Bookmark>): Int {
+        var changes = 0
+        val current = bookmarks.value.toMutableList()
+        for (r in remote) {
+            val idxByTitle = current.indexOfFirst { it.title.equals(r.title, ignoreCase = true) }
+            if (idxByTitle >= 0) {
+                if (current[idxByTitle].url != r.url) {
+                    current[idxByTitle] = current[idxByTitle].copy(url = r.url)
+                    changes++
+                }
+            } else if (current.none { it.url.equals(r.url, ignoreCase = true) }) {
+                current.add(r)
+                changes++
+            }
+        }
+        if (changes > 0) {
+            bookmarks.value = current
+            writeBookmarks()
+        }
+        return changes
     }
 
     fun removeBookmark(url: String) {
