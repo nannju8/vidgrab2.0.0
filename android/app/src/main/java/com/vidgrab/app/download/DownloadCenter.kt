@@ -142,7 +142,9 @@ object DownloadCenter {
                 enforceNetworkPolicy()
                 return
             }
-            val busy = _tasks.value.count { it.status == DlStatus.RUNNING || it.status == DlStatus.MERGING }
+            // Seuls les téléchargements réseau (RUNNING) occupent les slots parallèles ;
+            // la phase MERGING (fusion/enregistrement local) libère la place pour le fichier suivant.
+            val busy = _tasks.value.count { it.status == DlStatus.RUNNING }
             var slots = MAX_PARALLEL - busy
             if (slots <= 0) return
             for (t in _tasks.value.filter { it.status == DlStatus.QUEUED }) {
@@ -174,14 +176,20 @@ object DownloadCenter {
                 HlsDownloader.download(
                     app, id, v, File(dir, id),
                     { d, t -> progress(id, d, t) },
-                    { setStatus(id, DlStatus.MERGING) }
+                    {
+                        setStatus(id, DlStatus.MERGING)
+                        pump()
+                    }
                 )
             } else {
                 val f = File(dir, "$id.${v.format.lowercase()}")
                 DirectDownloader.download(id, v, f) { d, t -> progress(id, d, t) }
                 f
             }
-            setStatus(id, DlStatus.MERGING)
+            if (find(id)?.status != DlStatus.MERGING) {
+                setStatus(id, DlStatus.MERGING)
+                pump()
+            }
             val uri = Storage.saveToMovies(app, result, v.title)
             if (uri == null) throw IllegalStateException("Enregistrement MediaStore impossible")
             cleanup(id)
