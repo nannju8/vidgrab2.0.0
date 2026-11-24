@@ -1,5 +1,6 @@
 package com.vidgrab.app.ui.browser
 
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateDpAsState
@@ -33,6 +34,8 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.ArrowForward
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.DeleteSweep
 import androidx.compose.material.icons.rounded.History
@@ -41,7 +44,7 @@ import androidx.compose.material.icons.rounded.QuestionMark
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Star
-import androidx.compose.material.icons.rounded.ArrowForward
+import androidx.compose.material.icons.rounded.Sync
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -54,6 +57,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -63,6 +67,7 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
@@ -74,6 +79,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vidgrab.app.data.AppPrefs
 import com.vidgrab.app.data.Bookmark
+import com.vidgrab.app.data.SitesSyncApi
 import com.vidgrab.app.ui.MainViewModel
 import com.vidgrab.app.ui.components.GlassCard
 import com.vidgrab.app.ui.components.GlassIconButton
@@ -87,6 +93,7 @@ import com.vidgrab.app.ui.components.staggerIn
 import com.vidgrab.app.ui.theme.VG
 import com.vidgrab.app.web.TabManager
 import com.vidgrab.app.web.TabState
+import kotlinx.coroutines.launch
 
 private data class Shortcut(val name: String, val letter: String, val color: Color, val url: String)
 
@@ -124,13 +131,16 @@ fun HomeScreen(
     onOpenSettings: () -> Unit,
     onOpenHelp: () -> Unit
 ) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
     val bookmarks by AppPrefs.bookmarks.collectAsStateWithLifecycle()
     val history by AppPrefs.history.collectAsStateWithLifecycle()
     val query by vm.query.collectAsStateWithLifecycle()
     val google by vm.googleSuggestions.collectAsStateWithLifecycle()
     val haptic = LocalHapticFeedback.current
     val focus = LocalFocusManager.current
-    var renameTarget by remember { mutableStateOf<Bookmark?>(null) }
+    var editTarget by remember { mutableStateOf<Bookmark?>(null) }
+    var addDialog by remember { mutableStateOf(false) }
     var moreMenu by remember { mutableStateOf(false) }
 
     fun open(input: String) {
@@ -152,6 +162,7 @@ fun HomeScreen(
                 GlassIconButton(Icons.Rounded.MoreVert, "Menu") { moreMenu = true }
                 DropdownMenu(expanded = moreMenu, onDismissRequest = { moreMenu = false }) {
                     DropdownMenuItem(text = { Text("Nouvel onglet") }, onClick = { moreMenu = false; TabManager.openNewTab() })
+                    DropdownMenuItem(text = { Text("Ajouter un site") }, onClick = { moreMenu = false; addDialog = true })
                     DropdownMenuItem(text = { Text("Effacer l'historique") }, onClick = { moreMenu = false; AppPrefs.clearHistory() })
                     DropdownMenuItem(text = { Text("Paramètres") }, onClick = { moreMenu = false; onOpenSettings() })
                 }
@@ -219,14 +230,46 @@ fun HomeScreen(
             }
         }
 
-        // ---- Mes favoris ----
+        // ---- Sites enregistrés & favoris ----
         Spacer(Modifier.height(26.dp))
-        SectionLabel("Mes favoris", Modifier.padding(horizontal = 20.dp))
+        Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp), verticalAlignment = Alignment.CenterVertically) {
+            SectionLabel("Sites enregistrés")
+            Spacer(Modifier.weight(1f))
+            Row(
+                Modifier.clip(RoundedCornerShape(50)).clickable {
+                    scope.launch {
+                        val res = SitesSyncApi.fetchRemoteSites()
+                        res.onSuccess { list ->
+                            val updated = AppPrefs.mergeSyncedBookmarks(list)
+                            val msg = if (updated > 0) "$updated lien(s) mis à jour" else "Tous les liens sont déjà à jour"
+                            Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show()
+                        }.onFailure {
+                            Toast.makeText(ctx, "Synchronisation impossible hors ligne", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }.padding(horizontal = 8.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Rounded.Sync, null, Modifier.size(16.dp), tint = VG.Indigo)
+                Spacer(Modifier.width(4.dp))
+                Text("Synchro", fontSize = 12.sp, color = VG.Indigo, fontWeight = FontWeight.SemiBold)
+            }
+            Spacer(Modifier.width(6.dp))
+            Row(
+                Modifier.clip(RoundedCornerShape(50)).clickable { addDialog = true }
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Rounded.Add, null, Modifier.size(16.dp), tint = VG.Cyan)
+                Spacer(Modifier.width(4.dp))
+                Text("Ajouter", fontSize = 12.sp, color = VG.Cyan, fontWeight = FontWeight.SemiBold)
+            }
+        }
         Spacer(Modifier.height(10.dp))
         if (bookmarks.isEmpty()) {
             GlassCard(Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
                 Text(
-                    "Touchez l'étoile ★ dans la barre d'adresse pour ajouter un site à vos favoris.",
+                    "Appuyez sur « Ajouter » ou sur l'étoile ★ dans la barre d'adresse pour enregistrer un site.",
                     Modifier.padding(16.dp), fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
@@ -254,7 +297,7 @@ fun HomeScreen(
                             }
                         }
                         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                            DropdownMenuItem(text = { Text("Renommer") }, onClick = { menu = false; renameTarget = b })
+                            DropdownMenuItem(text = { Text("Modifier (nom & lien)") }, onClick = { menu = false; editTarget = b })
                             DropdownMenuItem(text = { Text("Supprimer") }, onClick = { menu = false; AppPrefs.removeBookmark(b.url) })
                         }
                     }
@@ -311,19 +354,60 @@ fun HomeScreen(
         }
     }
 
-    renameTarget?.let { b ->
-        var name by remember(b.url) { mutableStateOf(b.title) }
+    if (addDialog) {
+        var name by remember { mutableStateOf("") }
+        var url by remember { mutableStateOf("") }
         AlertDialog(
-            onDismissRequest = { renameTarget = null },
-            title = { Text("Renommer le favori") },
-            text = { OutlinedTextField(name, { name = it }, singleLine = true) },
+            onDismissRequest = { addDialog = false },
+            title = { Text("Enregistrer un site") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(name, { name = it }, label = { Text("Nom du site") }, singleLine = true)
+                    OutlinedTextField(
+                        url, { url = it },
+                        label = { Text("Lien (URL)") },
+                        placeholder = { Text("https://exemple.com") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri)
+                    )
+                }
+            },
             confirmButton = {
                 TextButton(onClick = {
-                    if (name.isNotBlank()) AppPrefs.renameBookmark(b.url, name.trim())
-                    renameTarget = null
+                    if (url.isNotBlank()) {
+                        AppPrefs.addBookmark(name, url)
+                        addDialog = false
+                    }
                 }) { Text("Enregistrer") }
             },
-            dismissButton = { TextButton(onClick = { renameTarget = null }) { Text("Annuler") } }
+            dismissButton = { TextButton(onClick = { addDialog = false }) { Text("Annuler") } }
+        )
+    }
+
+    editTarget?.let { b ->
+        var name by remember(b.url) { mutableStateOf(b.title) }
+        var url by remember(b.url) { mutableStateOf(b.url) }
+        AlertDialog(
+            onDismissRequest = { editTarget = null },
+            title = { Text("Modifier le site") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(name, { name = it }, label = { Text("Nom du site") }, singleLine = true)
+                    OutlinedTextField(
+                        url, { url = it },
+                        label = { Text("Nouveau lien (URL)") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri)
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    if (url.isNotBlank()) AppPrefs.updateBookmark(b.url, name, url)
+                    editTarget = null
+                }) { Text("Mettre à jour") }
+            },
+            dismissButton = { TextButton(onClick = { editTarget = null }) { Text("Annuler") } }
         )
     }
 }
