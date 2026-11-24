@@ -22,11 +22,13 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.DeleteSweep
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.Palette
+import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Star
 import androidx.compose.material.icons.rounded.Wifi
 import androidx.compose.material3.FilterChip
@@ -229,11 +231,33 @@ fun SettingsScreen(onBack: () -> Unit) {
                     }
                 }
             }
-            Spacer(Modifier.height(30.dp))
-            Text(
-                "VidGrab 1.0 · com.vidgrab.app",
-                Modifier.fillMaxWidth(), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+
+            Spacer(Modifier.height(22.dp))
+            SectionLabel("À propos de l'application")
+            Spacer(Modifier.height(8.dp))
+            GlassCard(Modifier.fillMaxWidth(), glow = VG.Indigo) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Rounded.AutoAwesome, null, tint = VG.Cyan)
+                        Spacer(Modifier.width(12.dp))
+                        Column {
+                            Text("VidGrab · Application IA", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                            Text("Version 1.0.0 · com.vidgrab.app", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                    Text(
+                        "VidGrab est une application intelligente assistée par IA conçue pour automatiser l'analyse des pages web, détecter les flux vidéo (MP4, HLS), télécharger à haute vitesse (y compris des séries complètes) et partager vos vidéos hors ligne en Wi-Fi, tout en protégeant votre vie privée.",
+                        fontSize = 12.sp,
+                        lineHeight = 17.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Rounded.Person, null, tint = VG.Indigo, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Créateur : Juliano Nantenaina", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = VG.Cyan)
+                    }
+                }
+            }
             Spacer(Modifier.height(40.dp))
         }
     }
