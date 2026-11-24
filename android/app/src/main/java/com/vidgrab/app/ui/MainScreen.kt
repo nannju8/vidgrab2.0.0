@@ -64,6 +64,7 @@ import com.vidgrab.app.ui.browser.TabSwitcher
 import com.vidgrab.app.ui.components.AuroraBackground
 import com.vidgrab.app.ui.components.FloatingNavBar
 import com.vidgrab.app.ui.components.GlassCard
+import com.vidgrab.app.ui.components.IntroOverlay
 import com.vidgrab.app.ui.components.bounceClick
 import com.vidgrab.app.ui.downloads.ProgressScreen
 import com.vidgrab.app.ui.library.LibraryScreen
@@ -76,6 +77,7 @@ import com.vidgrab.app.web.TabManager
 @Composable
 fun MainScreen(vm: MainViewModel = viewModel()) {
     val ctx = LocalContext.current
+    var showIntro by rememberSaveable { mutableStateOf(true) }
     var page by rememberSaveable { mutableIntStateOf(0) }
     var showTabs by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
@@ -103,7 +105,7 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
         }
     }
 
-    BackHandler(enabled = showTransfer || showTabs || showSettings || page != 0 || !tab.isHome || tab.customView != null) {
+    BackHandler(enabled = !showIntro && (showTransfer || showTabs || showSettings || page != 0 || !tab.isHome || tab.customView != null)) {
         when {
             showTransfer -> showTransfer = false
             showTabs -> showTabs = false
@@ -245,5 +247,9 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
         ) { TransferScreen(vm, onBack = { showTransfer = false }) }
 
         if (showHelp) HelpGuide(onDismiss = { showHelp = false })
+
+        if (showIntro) {
+            IntroOverlay(onFinished = { showIntro = false })
+        }
     }
 }
